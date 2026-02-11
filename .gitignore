@@ -44,8 +44,13 @@ next-env.d.ts
 # Documentation folder (app system docs and implementation notes)
 /docs/
 
+# Claude settings
+/.claude
+
 # Backup files
 *BACKUP*
+CLAUDE.md
+
 
 # Failed txs
 failedtxs.txt
