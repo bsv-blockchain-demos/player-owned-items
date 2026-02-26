@@ -1,17 +1,37 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { connectToMongo } from '@/lib/mongodb';
 import { createJWT } from '@/utils/jwt';
+import { verifyNonce } from '@bsv/sdk';
+import { getServerWallet } from '@/lib/serverWallet';
 
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { userId, username } = body;
+    const { userId, username, nonce } = body;
 
     // Validate input
     if (!userId || !username) {
       return NextResponse.json(
         { error: 'userId and username are required' },
         { status: 400 }
+      );
+    }
+
+    if (!nonce) {
+      return NextResponse.json(
+        { error: 'nonce is required' },
+        { status: 400 }
+      );
+    }
+
+    // Verify nonce — proves the requester holds the private key for identityKey
+    // counterparty = identityKey (the user's identity public key); backend reverses the same ECDH
+    const serverWallet = await getServerWallet();
+    const nonceValid = await verifyNonce(nonce, serverWallet, userId);
+    if (!nonceValid) {
+      return NextResponse.json(
+        { error: 'Invalid nonce' },
+        { status: 401 }
       );
     }
 

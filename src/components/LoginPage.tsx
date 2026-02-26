@@ -6,6 +6,7 @@ import { useAuthContext } from '@/contexts/WalletContext';
 import { useEquipment } from '@/contexts/EquipmentContext';
 import { usePlayer } from '@/contexts/PlayerContext';
 import toast from 'react-hot-toast';
+import { createNonce } from '@bsv/sdk';
 
 export default function LoginPage() {
   const router = useRouter();
@@ -46,6 +47,12 @@ export default function LoginPage() {
 
       const walletUsername = username.trim() || 'Wallet User';
 
+      // Fetch server identity key, then generate nonce
+      // The nonce proves this requester holds the private key for publicKey
+      const serverKeyRes = await fetch('/api/server-identity-key');
+      const { publicKey: serverIdentityKey } = await serverKeyRes.json();
+      const nonce = await createNonce(userWallet, serverIdentityKey);
+
       toast.loading('Logging in...', { id: loadingToast });
 
       const response = await fetch('/api/login', {
@@ -56,6 +63,7 @@ export default function LoginPage() {
         body: JSON.stringify({
           userId: publicKey,
           username: walletUsername,
+          nonce,
         }),
       });
 
