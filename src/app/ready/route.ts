@@ -2,10 +2,9 @@ import { NextResponse } from 'next/server'
 import { MongoClient } from 'mongodb'
 import { checkWalletBalance } from '@/utils/wallet-balance'
 
-const { MIN_BALANCE, MONGODB_URI } = process.env
-
 // app/ready/route.ts - combined check (wallet + db)
 export async function GET() {
+  const { MIN_BALANCE, MONGODB_URI } = process.env
   const client = new MongoClient(MONGODB_URI!)
   try {
     const balance = await checkWalletBalance()
