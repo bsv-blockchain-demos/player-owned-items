@@ -13,12 +13,12 @@ export async function middleware(req: NextRequest) {
   const token = (req.cookies.get("verified") as RequestCookie)?.value;
 
   // Public routes (don't require auth)
-  const publicPaths = ["/"];
+  const publicPaths = ["/", "/health", "/ready"];
   const isPublic = publicPaths.some((path) => req.nextUrl.pathname === path);
 
   if (isPublic) {
     // If already logged in and trying to access login page, redirect to battle
-    if (token) {
+    if (token && req.nextUrl.pathname === "/") {
       return NextResponse.redirect(new URL("/battle", req.url));
     }
     return NextResponse.next();
