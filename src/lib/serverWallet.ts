@@ -20,12 +20,12 @@ export async function getServerWallet(): Promise<WalletClient> {
     return serverWallet;
   }
 
-  const privateKey = process.env.SERVER_WALLET_PRIVATE_KEY;
-  const storageURL = process.env.SERVER_WALLET_STORAGE_URL || 'https://store-us-1.bsvb.tech';
-  const chain = (process.env.SERVER_WALLET_CHAIN as 'test' | 'main') || 'main';
+  const privateKey = process.env.SERVER_PRIVATE_KEY;
+  const storageURL = process.env.WALLET_STORAGE_URL || 'https://store-us-1.bsvb.tech';
+  const chain = (process.env.BSV_NETWORK as 'test' | 'main') || 'main';
 
   if (!privateKey) {
-    throw new Error('SERVER_WALLET_PRIVATE_KEY environment variable not set');
+    throw new Error('SERVER_PRIVATE_KEY environment variable not set');
   }
 
   // Create server wallet
@@ -66,9 +66,9 @@ export async function getServerIdentityPublicKey(): Promise<string> {
  * Use this for unlocking plain P2PKH payment inputs
  */
 export function getServerIdentityPrivateKey(): PrivateKey {
-  const privateKeyHex = process.env.SERVER_WALLET_PRIVATE_KEY;
+  const privateKeyHex = process.env.SERVER_PRIVATE_KEY;
   if (!privateKeyHex) {
-    throw new Error('SERVER_WALLET_PRIVATE_KEY environment variable not set');
+    throw new Error('SERVER_PRIVATE_KEY environment variable not set');
   }
   return PrivateKey.fromString(privateKeyHex, 'hex');
 }
