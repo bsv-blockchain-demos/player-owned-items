@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { WalletClient, PublicKey, Transaction } from '@bsv/sdk';
-import OrdLock from '@/utils/orderLock';
+import { WalletOrdLock } from '@bsv/wallet-helper';
 import { OrdinalsP2PKH } from '@/utils/ordinalP2PKH';
 import { usePlayer } from '@/contexts/PlayerContext';
 import toast from 'react-hot-toast';
@@ -212,14 +212,15 @@ export default function SellItemModal({ wallet, onClose, onSuccess }: SellItemMo
           suffix: selectedItem.suffix,
         };
 
-      const ordLock = new OrdLock();
-      const ordLockScript = ordLock.lock(
-        cancelAddress,
+      const ordLock = new WalletOrdLock();
+      const ordLockScript = await ordLock.lock({
+        ordAddress: cancelAddress,
         payAddress,
-        priceNum,
+        price: priceNum,
         assetId,
-        itemData
-      );
+        itemData,
+        metadata: { app: "monsterbattle", type: "ord" },
+      });
 
       const ordinalP2PKH = new OrdinalsP2PKH();
       const tokenUnlockTemplate = ordinalP2PKH.unlock(wallet, 'single', true);

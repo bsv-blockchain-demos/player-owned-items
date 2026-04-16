@@ -4,7 +4,7 @@ import { verifyJWT } from '@/utils/jwt';
 import { connectToMongo } from '@/lib/mongodb';
 import { ObjectId } from 'mongodb';
 import { getServerWallet } from '@/lib/serverWallet';
-import OrdLock from '@/utils/orderLock';
+import { WalletOrdLock } from '@bsv/wallet-helper';
 import { OrdinalsP2PKH } from '@/utils/ordinalP2PKH';
 import { Beef, Transaction, Script, P2PKH } from '@bsv/sdk';
 import { broadcastTX, getTransactionByTxID } from '@/utils/overlayFunctions';
@@ -117,11 +117,11 @@ export async function POST(request: NextRequest) {
     });
 
     // Create purchase unlock template
-    const ordLock = new OrdLock();
-    const purchaseUnlockTemplate = ordLock.purchaseListing(
-      1, // sourceSatoshis for the 1 sat UTXO
-      ordLockScript
-    );
+    const ordLock = new WalletOrdLock();
+    const purchaseUnlockTemplate = ordLock.purchaseUnlock({
+      sourceSatoshis: 1,
+      lockingScript: ordLockScript,
+    });
 
     console.log('🔓 [PURCHASE-LISTING] Created purchase unlock template');
 

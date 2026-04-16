@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { WalletClient, Transaction, Script } from '@bsv/sdk';
 import { createWalletPayment } from '@/utils/createWalletPayment';
 import toast from 'react-hot-toast';
-import OrdLock from '@/utils/orderLock';
+import { WalletOrdLock } from '@bsv/wallet-helper';
 import { OrdinalsP2PKH } from '@/utils/ordinalP2PKH';
 import { broadcastTX, getTransactionByTxID } from '@/utils/overlayFunctions';
 
@@ -118,15 +118,17 @@ export default function MarketplaceItemDetailsModal({
       const ordLockBeef = ordLockTxData.outputs[ordLockVout].beef;
       const ordLockTransaction = Transaction.fromBEEF(ordLockBeef);
 
-      const ordLock = new OrdLock();
+      const ordLock = new WalletOrdLock(wallet);
       const ordLockScript = Script.fromHex(listing.ordLockScript);
-      const cancelUnlockTemplate = ordLock.cancelListing(
-        wallet,
-        'all',
-        false,
-        1,
-        ordLockScript
-      );
+      const cancelUnlockTemplate = ordLock.cancelUnlock({
+        protocolID: [0, "monsterbattle"],
+        keyID: "0",
+        counterparty: "self",
+        signOutputs: 'all',
+        anyoneCanPay: false,
+        sourceSatoshis: 1,
+        lockingScript: ordLockScript,
+      });
       const cancelUnlockingLength = await cancelUnlockTemplate.estimateLength();
 
       const ordinalP2PKH = new OrdinalsP2PKH();

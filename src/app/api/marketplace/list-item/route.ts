@@ -4,7 +4,7 @@ import { verifyJWT } from '@/utils/jwt';
 import { connectToMongo } from '@/lib/mongodb';
 import { ObjectId } from 'mongodb';
 import { getLootItemById, LootItem, EquipmentStats } from '@/lib/loot-table';
-import OrdLock from '@/utils/orderLock';
+import { WalletOrdLock } from '@bsv/wallet-helper';
 import { Transaction, PublicKey } from '@bsv/sdk';
 import { getTransactionByTxID } from '@/utils/overlayFunctions';
 
@@ -220,14 +220,15 @@ export async function POST(request: NextRequest) {
     // ===== VALIDATE CLIENT-CREATED ORDLOCK TRANSACTION (ON-CHAIN) =====
     // Recompute the expected OrdLock locking script and verify it matches the
     // client-provided script and the actual transaction output.
-    const ordLock = new OrdLock();
-    const expectedOrdLockScript = ordLock.lock(
-      cancelAddress,  // cancelAddress (seller can cancel)
-      payAddress,  // payAddress (seller receives payment)
-      parseInt(price, 10),
+    const ordLock = new WalletOrdLock();
+    const expectedOrdLockScript = await ordLock.lock({
+      ordAddress: cancelAddress,
+      payAddress,
+      price: parseInt(price, 10),
       assetId,
-      itemData  // Full item metadata
-    );
+      itemData,
+      metadata: { app: "monsterbattle", type: "ord" },
+    });
 
     if (expectedOrdLockScript.toHex() !== ordLockScript) {
       return NextResponse.json(

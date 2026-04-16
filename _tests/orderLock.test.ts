@@ -4,12 +4,11 @@ import {
   MerklePath,
   Script,
   Utils,
-  Random,
   P2PKH,
   PublicKey
 } from '@bsv/sdk';
 import { OrdinalsP2PKH } from '../src/utils/ordinalP2PKH';
-import OrdLock from '../src/utils/orderLock';
+import { WalletOrdLock as OrdLock } from '@bsv/wallet-helper';
 import { makeWallet } from './helpers/mockWallet';
 
 describe('OrdLock - Marketplace Transaction Validation', () => {
@@ -76,13 +75,14 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
 
       // Create orderLock locking script
       const orderLock = new OrdLock();
-      const orderLockScript = orderLock.lock(
-        sellerAddress, // Can cancel
-        sellerAddress, // Payment destination
-        listPrice,
+      const orderLockScript = await orderLock.lock({
+        ordAddress: sellerAddress,
+        payAddress: sellerAddress,
+        price: listPrice,
         assetId,
-        itemData
-      );
+        itemData,
+        metadata: { app: "monsterbattle", type: "ord" },
+      });
 
       listingTx.addOutput({
         lockingScript: orderLockScript,
@@ -166,14 +166,17 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
       });
 
       const orderLock = new OrdLock();
+      const orderLockScript = await orderLock.lock({
+        ordAddress: sellerAddress,
+        payAddress: sellerAddress,
+        price: 5000,
+        assetId,
+        itemData: complexItemData,
+        metadata: { app: "monsterbattle", type: "ord" },
+      });
+
       listingTx.addOutput({
-        lockingScript: orderLock.lock(
-          sellerAddress,
-          sellerAddress,
-          5000,
-          assetId,
-          complexItemData
-        ),
+        lockingScript: orderLockScript,
         satoshis: 1
       });
 
@@ -244,14 +247,15 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
         unlockingScriptTemplate: new OrdinalsP2PKH().unlock(sellerWallet)
       });
 
-      const orderLock = new OrdLock();
-      const orderLockScript = orderLock.lock(
-        sellerAddress,
-        sellerAddress,
-        2000,
+      const orderLock = new OrdLock(sellerWallet);
+      const orderLockScript = await orderLock.lock({
+        ordAddress: sellerAddress,
+        payAddress: sellerAddress,
+        price: 2000,
         assetId,
-        itemData
-      );
+        itemData,
+        metadata: { app: "monsterbattle", type: "ord" },
+      });
 
       listingTx.addOutput({
         lockingScript: orderLockScript,
@@ -272,7 +276,11 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
       cancelTx.addInput({
         sourceTransaction: listingTx,
         sourceOutputIndex: 0,
-        unlockingScriptTemplate: orderLock.cancelListing(sellerWallet)
+        unlockingScriptTemplate: orderLock.cancelUnlock({
+          protocolID: [0, "monsterbattle"],
+          keyID: "0",
+          counterparty: "self",
+        })
       });
 
       // Return NFT to seller's ordinalP2PKH
@@ -334,9 +342,18 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
         unlockingScriptTemplate: new OrdinalsP2PKH().unlock(sellerWallet)
       });
 
-      const orderLock = new OrdLock();
+      const orderLock = new OrdLock(sellerWallet);
+      const orderLockScript = await orderLock.lock({
+        ordAddress: sellerAddress,
+        payAddress: sellerAddress,
+        price: 1000,
+        assetId,
+        itemData,
+        metadata: { app: "monsterbattle", type: "ord" },
+      });
+
       listingTx.addOutput({
-        lockingScript: orderLock.lock(sellerAddress, sellerAddress, 1000, assetId, itemData),
+        lockingScript: orderLockScript,
         satoshis: 1
       });
 
@@ -354,7 +371,12 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
       cancelTx.addInput({
         sourceTransaction: listingTx,
         sourceOutputIndex: 0,
-        unlockingScriptTemplate: orderLock.cancelListing(sellerWallet, 'all')
+        unlockingScriptTemplate: orderLock.cancelUnlock({
+          protocolID: [0, "monsterbattle"],
+          keyID: "0",
+          counterparty: "self",
+          signOutputs: 'all',
+        })
       });
 
       cancelTx.addOutput({
@@ -428,13 +450,14 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
       });
 
       const orderLock = new OrdLock();
-      const orderLockScript = orderLock.lock(
-        sellerAddress,
-        sellerAddress,
-        listPrice,
+      const orderLockScript = await orderLock.lock({
+        ordAddress: sellerAddress,
+        payAddress: sellerAddress,
+        price: listPrice,
         assetId,
-        itemData
-      );
+        itemData,
+        metadata: { app: "monsterbattle", type: "ord" },
+      });
 
       listingTx.addOutput({
         lockingScript: orderLockScript,
@@ -450,8 +473,9 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
       );
 
       // Step 3: Buyer creates funding transaction
-      const buyerAddress = PublicKey.fromString(buyerPubKey).toAddress();
-      const buyerPkh = Utils.fromBase58Check(buyerAddress).data as number[];
+      // Use raw private key address for P2PKH funding UTXO (must match P2PKH.unlock(buyerPriv))
+      const buyerFundingAddress = buyerPriv.toPublicKey().toAddress();
+      const buyerPkh = Utils.fromBase58Check(buyerFundingAddress).data as number[];
 
       // Create a P2PKH funding UTXO for the buyer
       const fundingTx = new Transaction();
@@ -479,10 +503,10 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
       purchaseTx.addInput({
         sourceTransaction: listingTx,
         sourceOutputIndex: 0,
-        unlockingScriptTemplate: orderLock.purchaseListing(
-          1, // Always 1 satoshi for NFT listing
-          listingOutput.lockingScript
-        )
+        unlockingScriptTemplate: orderLock.purchaseUnlock({
+          sourceSatoshis: 1,
+          lockingScript: listingOutput.lockingScript
+        })
       });
 
       // Input 1: Buyer's funding UTXO (provides payment)
@@ -516,7 +540,6 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
         satoshis: listPrice
       });
 
-      await purchaseTx.fee();
       await purchaseTx.sign();
 
       const isValid = await purchaseTx.verify('scripts only');
@@ -572,7 +595,6 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
 
       // Create listing
       const sellerAddress = PublicKey.fromString(sellerPubKey).toAddress();
-      const buyerAddress = PublicKey.fromString(buyerPubKey).toAddress();
       const listingTx = new Transaction();
 
       listingTx.addInput({
@@ -582,8 +604,17 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
       });
 
       const orderLock = new OrdLock();
+      const orderLockScript = await orderLock.lock({
+        ordAddress: sellerAddress,
+        payAddress: sellerAddress,
+        price: listPrice,
+        assetId,
+        itemData,
+        metadata: { app: "monsterbattle", type: "ord" },
+      });
+
       listingTx.addOutput({
-        lockingScript: orderLock.lock(sellerAddress, sellerAddress, listPrice, assetId, itemData),
+        lockingScript: orderLockScript,
         satoshis: 1
       });
 
@@ -595,8 +626,9 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
         5001
       );
 
-      // Create buyer funding UTXO
-      const buyerPkh = Utils.fromBase58Check(buyerAddress).data as number[];
+      // Create buyer funding UTXO (use raw private key address to match P2PKH.unlock)
+      const buyerFundingAddress = buyerPriv.toPublicKey().toAddress();
+      const buyerPkh = Utils.fromBase58Check(buyerFundingAddress).data as number[];
       const fundingTx = new Transaction();
       fundingTx.addInput({
         sourceTXID: '1111111111111111111111111111111111111111111111111111111111111111',
@@ -622,10 +654,10 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
       purchaseTx.addInput({
         sourceTransaction: listingTx,
         sourceOutputIndex: 0,
-        unlockingScriptTemplate: orderLock.purchaseListing(
-          1, // Always 1 satoshi for NFT listing
-          listingOutput2.lockingScript
-        )
+        unlockingScriptTemplate: orderLock.purchaseUnlock({
+          sourceSatoshis: 1,
+          lockingScript: listingOutput2.lockingScript
+        })
       });
 
       // Input 1: Buyer's funding
@@ -660,7 +692,6 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
         satoshis: 500 // Change
       });
 
-      await purchaseTx.fee();
       await purchaseTx.sign();
 
       const isValid = await purchaseTx.verify('scripts only');
@@ -719,8 +750,17 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
       });
 
       const orderLock = new OrdLock();
+      const orderLockScript = await orderLock.lock({
+        ordAddress: sellerAddress,
+        payAddress: sellerAddress,
+        price: listPrice,
+        assetId,
+        itemData,
+        metadata: { app: "monsterbattle", type: "ord" },
+      });
+
       listingTx.addOutput({
-        lockingScript: orderLock.lock(sellerAddress, sellerAddress, listPrice, assetId, itemData),
+        lockingScript: orderLockScript,
         satoshis: 1
       });
 
@@ -732,9 +772,9 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
         6001
       );
 
-      // Create buyer funding UTXO
-      const buyerAddress = PublicKey.fromString(buyerPubKey).toAddress();
-      const buyerPkh = Utils.fromBase58Check(buyerAddress).data as number[];
+      // Create buyer funding UTXO (use raw private key address to match P2PKH.unlock)
+      const buyerFundingAddress = buyerPriv.toPublicKey().toAddress();
+      const buyerPkh = Utils.fromBase58Check(buyerFundingAddress).data as number[];
       const fundingTx = new Transaction();
       fundingTx.addInput({
         sourceTXID: '1111111111111111111111111111111111111111111111111111111111111111',
@@ -760,10 +800,10 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
       purchaseTx.addInput({
         sourceTransaction: listingTx,
         sourceOutputIndex: 0,
-        unlockingScriptTemplate: orderLock.purchaseListing(
-          1, // Always 1 satoshi for NFT listing
-          listingOutput2.lockingScript
-        )
+        unlockingScriptTemplate: orderLock.purchaseUnlock({
+          sourceSatoshis: 1,
+          lockingScript: listingOutput2.lockingScript
+        })
       });
 
       // Input 1: Buyer's funding
@@ -791,7 +831,6 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
         satoshis: listPrice // Must match exactly
       });
 
-      await purchaseTx.fee();
       await purchaseTx.sign();
 
       const isValid = await purchaseTx.verify('scripts only');
@@ -879,14 +918,17 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
       });
 
       const orderLock = new OrdLock();
+      const orderLockScript = await orderLock.lock({
+        ordAddress: sellerAddress,
+        payAddress: sellerAddress,
+        price: 100000, // High price for legendary item
+        assetId,
+        itemData: complexItemData,
+        metadata: { app: "monsterbattle", type: "ord" },
+      });
+
       listingTx.addOutput({
-        lockingScript: orderLock.lock(
-          sellerAddress,
-          sellerAddress,
-          100000, // High price for legendary item
-          assetId,
-          complexItemData
-        ),
+        lockingScript: orderLockScript,
         satoshis: 1
       });
 
@@ -907,17 +949,21 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
 
     it('should estimate unlock script lengths correctly', async () => {
       const sellerWallet = await makeWallet('main', storageURL, new PrivateKey(111).toHex());
-      const orderLock = new OrdLock();
+      const orderLock = new OrdLock(sellerWallet);
 
-      // Test cancelListing estimate
-      const cancelTemplate = orderLock.cancelListing(sellerWallet);
+      // Test cancelUnlock estimate
+      const cancelTemplate = orderLock.cancelUnlock({
+        protocolID: [0, "monsterbattle"],
+        keyID: "0",
+        counterparty: "self",
+      });
       const cancelEstimate = await cancelTemplate.estimateLength();
 
       expect(cancelEstimate).toBe(108);
       expect(typeof cancelEstimate).toBe('number');
       expect(cancelEstimate).toBeGreaterThan(0);
 
-      // purchaseListing estimate is dynamic based on transaction
+      // purchaseUnlock estimate is dynamic based on transaction
       // (tested implicitly in purchase tests)
     }, 30000);
   });
@@ -981,8 +1027,15 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
         unlockingScriptTemplate: new OrdinalsP2PKH().unlock(minterWallet)
       });
 
-      const orderLock = new OrdLock();
-      const listing1Script = orderLock.lock(minterAddress, minterAddress, 3000, assetId, itemData);
+      const orderLock = new OrdLock(minterWallet);
+      const listing1Script = await orderLock.lock({
+        ordAddress: minterAddress,
+        payAddress: minterAddress,
+        price: 3000,
+        assetId,
+        itemData,
+        metadata: { app: "monsterbattle", type: "ord" },
+      });
 
       listing1Tx.addOutput({
         lockingScript: listing1Script,
@@ -1000,7 +1053,11 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
       cancelTx.addInput({
         sourceTransaction: listing1Tx,
         sourceOutputIndex: 0,
-        unlockingScriptTemplate: orderLock.cancelListing(minterWallet)
+        unlockingScriptTemplate: orderLock.cancelUnlock({
+          protocolID: [0, "monsterbattle"],
+          keyID: "0",
+          counterparty: "self",
+        })
       });
 
       cancelTx.addOutput({
@@ -1030,7 +1087,14 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
         unlockingScriptTemplate: new OrdinalsP2PKH().unlock(minterWallet)
       });
 
-      const listing2Script = orderLock.lock(minterAddress, minterAddress, 2500, assetId, itemData);
+      const listing2Script = await orderLock.lock({
+        ordAddress: minterAddress,
+        payAddress: minterAddress,
+        price: 2500,
+        assetId,
+        itemData,
+        metadata: { app: "monsterbattle", type: "ord" },
+      });
 
       listing2Tx.addOutput({
         lockingScript: listing2Script,
@@ -1042,9 +1106,9 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
 
       listing2Tx.merklePath = MerklePath.fromCoinbaseTxidAndHeight(listing2Tx.id('hex'), 8003);
 
-      // Step 5: Create buyer funding UTXO
-      const buyerAddress = PublicKey.fromString(buyerPubKey).toAddress();
-      const buyerPkh = Utils.fromBase58Check(buyerAddress).data as number[];
+      // Step 5: Create buyer funding UTXO (use raw private key address to match P2PKH.unlock)
+      const buyerFundingAddress = buyerPriv.toPublicKey().toAddress();
+      const buyerPkh = Utils.fromBase58Check(buyerFundingAddress).data as number[];
       const fundingTx = new Transaction();
       fundingTx.addInput({
         sourceTXID: '1111111111111111111111111111111111111111111111111111111111111111',
@@ -1070,10 +1134,10 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
       purchaseTx.addInput({
         sourceTransaction: listing2Tx,
         sourceOutputIndex: 0,
-        unlockingScriptTemplate: orderLock.purchaseListing(
-          1, // Always 1 satoshi for NFT listing
-          listing2Output.lockingScript
-        )
+        unlockingScriptTemplate: orderLock.purchaseUnlock({
+          sourceSatoshis: 1,
+          lockingScript: listing2Output.lockingScript
+        })
       });
 
       // Input 1: Buyer's funding
@@ -1105,7 +1169,6 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
         satoshis: 2500
       });
 
-      await purchaseTx.fee();
       await purchaseTx.sign();
 
       const purchaseValid = await purchaseTx.verify('scripts only');

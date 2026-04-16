@@ -120,7 +120,7 @@ export async function createWalletPayment(
   });
 
   return {
-    paymentTx: paymentAction.tx!,
+    paymentTx: Array.from(paymentAction.tx!),
     paymentTxId: paymentAction.txid,
     walletParams: unlockParams,  // Server uses these params with user identity as counterparty
   };
