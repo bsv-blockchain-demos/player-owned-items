@@ -1,13 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { connectToMongo } from '@/lib/mongodb';
 import { createJWT } from '@/utils/jwt';
-import { verifyNonce } from '@bsv/sdk';
 import { getServerWallet } from '@/lib/serverWallet';
+import { authServer } from '@/lib/authProof';
+import { consumeNonce } from '@/lib/authNonceStore';
 
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { userId, username, nonce } = body;
+    const { userId, username, proof } = body;
 
     // Validate input
     if (!userId || !username) {
@@ -17,20 +18,19 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    if (!nonce) {
+    if (!proof) {
       return NextResponse.json(
-        { error: 'nonce is required' },
+        { error: 'proof is required' },
         { status: 400 }
       );
     }
 
-    // Verify nonce — proves the requester holds the private key for identityKey
-    // counterparty = identityKey (the user's identity public key); backend reverses the same ECDH
+    // Signed-proof check — expiry-bound, single-use proof of key ownership
     const serverWallet = await getServerWallet();
-    const nonceValid = await verifyNonce(nonce, serverWallet, userId);
-    if (!nonceValid) {
+    const proofResult = await authServer.verifyAuthProof(serverWallet, proof, 'login', { consumeNonce });
+    if (!proofResult.valid || proofResult.identityKey !== userId) {
       return NextResponse.json(
-        { error: 'Invalid nonce' },
+        { error: proofResult.error ?? 'Proof identity mismatch' },
         { status: 401 }
       );
     }
