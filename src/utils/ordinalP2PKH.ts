@@ -13,6 +13,13 @@ import {
      PublicKey
  } from "@bsv/sdk";
 import { calculatePreimage } from "./createPreimage";
+import type { Derivation } from "./tokenDerivation";
+
+const LEGACY_DERIVATION: Derivation = {
+    protocolID: [0, "monsterbattle"],
+    keyID: "0",
+    counterparty: "self",
+};
 
 export class OrdinalsP2PKH implements ScriptTemplate {
     lock(
@@ -90,6 +97,7 @@ export class OrdinalsP2PKH implements ScriptTemplate {
         anyoneCanPay = false,
         sourceSatoshis?: number,
         lockingScript?: Script,
+        derivation: Derivation = LEGACY_DERIVATION,
     ): {
         sign: (tx: Transaction, inputIndex: number) => Promise<UnlockingScript>;
         estimateLength: () => Promise<number>;
@@ -98,20 +106,18 @@ export class OrdinalsP2PKH implements ScriptTemplate {
             sign: async (tx: Transaction, inputIndex: number) => {
                  const { preimage, signatureScope } = calculatePreimage(tx, inputIndex, signOutputs, anyoneCanPay, sourceSatoshis, lockingScript);
 
-                // include the pattern from BRC-29
                 const { signature } = await wallet.createSignature({
                     hashToDirectlySign: Hash.hash256(preimage),
-                    protocolID: [0, "monsterbattle"],
-                    keyID: "0",
-                    counterparty: 'self'
+                    protocolID: derivation.protocolID,
+                    keyID: derivation.keyID,
+                    counterparty: derivation.counterparty,
                 })
 
-                console.log({ signature })
-
                 const { publicKey } = await wallet.getPublicKey({
-                    protocolID: [0, "monsterbattle"],
-                    keyID: "0",
-                    counterparty: 'self'
+                    protocolID: derivation.protocolID,
+                    keyID: derivation.keyID,
+                    counterparty: derivation.counterparty,
+                    forSelf: derivation.counterparty !== 'self',
                 })
 
                 const rawSignature = Signature.fromDER(signature, 'hex')

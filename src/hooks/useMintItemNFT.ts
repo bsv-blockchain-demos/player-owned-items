@@ -1,6 +1,8 @@
 import { useState, useCallback } from 'react';
 import { WalletClient } from '@bsv/sdk';
 import { createWalletPayment } from '@/utils/createWalletPayment';
+import { internalizeToBasket } from '@/utils/internalizeToBasket';
+import { decodeBeef, encodeBeef } from '@/utils/beefEncoding';
 
 /**
  * Hook for minting a dropped item as an NFT on the BSV blockchain
@@ -63,6 +65,7 @@ export interface MintItemNFTResult {
   transactionId?: string;      // BSV transaction ID
   success: boolean;
   error?: string;
+  internalizeWarning?: string; // Set when mint succeeded but wallet basket adoption failed (recoverable)
 }
 
 export function useMintItemNFT() {
@@ -102,11 +105,8 @@ export function useMintItemNFT() {
         throw new Error('Wallet not authenticated');
       }
 
-      // Get player public key for NFT transfer
-      const { publicKey } = await wallet.getPublicKey({
-        protocolID: [0, "monsterbattle"],
-        keyID: "0",
-      });
+      // Identity key is the derivation counterparty the server locks toward
+      const { publicKey: userIdentityKey } = await wallet.getPublicKey({ identityKey: true });
 
       // Fetch server identity key for payment counterparty
       const serverPubKeyResponse = await fetch('/api/server-identity-key');
@@ -135,7 +135,7 @@ export function useMintItemNFT() {
         itemName: itemData.name,
         rarity: itemData.rarity,
         type: itemData.type,
-        publicKey,
+        userIdentityKey,
         paymentTxId,
         walletParams,
       });
@@ -170,8 +170,8 @@ export function useMintItemNFT() {
         body: JSON.stringify({
           inventoryItemId: itemData.inventoryItemId,
           itemData: serverMintData,
-          userPublicKey: publicKey,
-          paymentTx,          // WalletP2PKH payment BEEF
+          userIdentityKey,
+          paymentTx: encodeBeef(paymentTx),  // base64 BEEF, symmetric with server decodeBeef
           walletParams,       // Derivation params for unlocking
         }),
       });
@@ -189,11 +189,29 @@ export function useMintItemNFT() {
         mintOutpoint: result.mintOutpoint, // Proof of original mint
       });
 
+      // Record the output in the wallet basket. Non-fatal: the NFT is already
+      // minted server-side, so a failure here is recoverable via reindexFromBasket.
+      let internalizeWarning: string | undefined;
+      if (typeof result.transferBeef === 'string' && result.received) {
+        try {
+          await internalizeToBasket(
+            wallet,
+            decodeBeef(result.transferBeef),
+            [result.received],
+            `Receive ${itemData.name}`,
+          );
+        } catch (internalizeErr) {
+          internalizeWarning = internalizeErr instanceof Error ? internalizeErr.message : 'Failed to record item in wallet';
+          console.warn('Item minted server-side but wallet internalize failed (recoverable via reindexFromBasket):', internalizeErr);
+        }
+      }
+
       return {
         nftId: result.nftId,
         tokenId: result.tokenId,         // Current location
         transactionId: result.tokenId?.split('.')[0], // Extract txid from outpoint
         success: true,
+        internalizeWarning,
       };
 
     } catch (err) {
