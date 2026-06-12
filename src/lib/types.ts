@@ -419,6 +419,8 @@ export interface MaterialToken {
   transactionId?: string;  // DEPRECATED: Use tokenId instead (redundant, can be extracted from tokenId)
   quantity: number;        // Current quantity of this material
   metadata?: Record<string, any>; // Token metadata
+  keyId?: string;          // Nonce used to derive the key locking this token (absent = legacy fixed key)
+  counterparty?: string;   // Derivation counterparty (the server identity key that locked to user)
   mintOutpoint?: string;   // Server mint outpoint (txid.vout) - proves server minted token
   transferTransactionId?: string; // DEPRECATED: Use mintOutpoint/tokenId instead (redundant)
   consumed?: boolean;      // True if token was burned (quantity reached 0)

@@ -3,6 +3,9 @@ import { WalletClient, Transaction } from '@bsv/sdk';
 import { OrdinalsP2PKH } from '@/utils/ordinalP2PKH';
 import { createWalletPayment } from '@/utils/createWalletPayment';
 import { getTransactionByTxID, broadcastTX } from './useOverlayFunctions';
+import { encodeBeef, decodeBeef } from '@/utils/beefEncoding';
+import { internalizeToBasket } from '@/utils/internalizeToBasket';
+import { TOKEN_PROTOCOL, generateNonce, deriveRecipientKey } from '@/utils/tokenDerivation';
 
 /**
  * Hook for updating material token quantities on the BSV blockchain
@@ -56,6 +59,8 @@ export interface MaterialTokenUpdate {
   tier?: number;                 // Material tier (if applicable)
   currentTokenId: string;        // Current token ID on blockchain
   currentQuantity: number;       // Current quantity (for validation)
+  keyId?: string;                // Derivation nonce used to lock this token (absent = legacy)
+  counterparty?: string;         // Counterparty used to lock this token (absent = legacy)
   operation: MaterialUpdateOperation;
   quantity: number;              // Amount to add/subtract/set
   inventoryItemIds?: string[];   // UserInventory IDs to consume after update
@@ -139,16 +144,13 @@ export function useUpdateMaterialToken() {
         throw new Error('Wallet not authenticated');
       }
 
-      // Get player public key
-      const { publicKey } = await wallet.getPublicKey({
-        protocolID: [0, "monsterbattle"],
-        keyID: "0",
-      });
+      // Identity key is the derivation counterparty the server locks toward
+      const { publicKey: userIdentityKey } = await wallet.getPublicKey({ identityKey: true });
 
       console.log('Updating material tokens:', {
         updateCount: updates.length,
         operations: updates.map(u => `${u.operation} ${u.quantity} ${u.lootTableId}`),
-        publicKey,
+        userIdentityKey,
       });
 
       // Validate updates
@@ -158,13 +160,7 @@ export function useUpdateMaterialToken() {
 
       const results: MaterialUpdateResult[] = [];
 
-      // Get server keys (needed for 'add' operations)
-      const serverPubKeyResponse = await fetch('/api/server-public-key');
-      if (!serverPubKeyResponse.ok) {
-        throw new Error('Failed to fetch server public key');
-      }
-      const { publicKey: serverPublicKey } = await serverPubKeyResponse.json();
-
+      // Get server identity key (needed for 'add' operations)
       const serverIdentityKeyResponse = await fetch('/api/server-identity-key');
       if (!serverIdentityKeyResponse.ok) {
         throw new Error('Failed to fetch server identity key');
@@ -175,7 +171,7 @@ export function useUpdateMaterialToken() {
       for (const update of updates) {
         console.log(`Processing ${update.operation} for ${update.lootTableId}`);
 
-        // For 'add' operations, use transfer-to-server pattern
+        // For 'add' operations, use transfer-to-server pattern (derived-key)
         if (update.operation === 'add') {
           console.log(`[ADD] Transferring ${update.lootTableId} to server for merge`);
 
@@ -190,17 +186,22 @@ export function useUpdateMaterialToken() {
           // Parse transaction from BEEF
           const previousTransaction = Transaction.fromBEEF(oldTx.outputs[0].beef);
 
-          // Create transfer transaction to server
           const ordinalP2PKH = new OrdinalsP2PKH();
 
-          // Create unlocking script template
-          const unlockTemplate = ordinalP2PKH.unlock(wallet, "all", false);
+          // Unlock existing token with its derivation (legacy fallback when absent)
+          const existingDerivation = update.keyId
+            ? { protocolID: TOKEN_PROTOCOL, keyID: update.keyId, counterparty: update.counterparty! }
+            : undefined;
+          const unlockTemplate = ordinalP2PKH.unlock(wallet, 'all', false, undefined, undefined, existingDerivation);
           const unlockingScriptLength = await unlockTemplate.estimateLength();
 
-          // Transfer entire token to server
+          // Lock the transfer output to a fresh server recipient-derived key
+          const transferNonce = generateNonce();
+          const serverKey = await deriveRecipientKey(wallet, serverIdentityKey, transferNonce);
+
           const assetId = update.currentTokenId.replace('.', '_');
           const transferLockingScript = ordinalP2PKH.lock(
-            serverPublicKey,
+            serverKey,
             assetId,
             {
               name: 'material_token',
@@ -212,7 +213,7 @@ export function useUpdateMaterialToken() {
               tier: update.tier || 1,
             },
             'transfer',
-            update.currentQuantity  // Transfer current amt to server
+            update.currentQuantity
           );
 
           // Step 1: Create action
@@ -256,9 +257,7 @@ export function useUpdateMaterialToken() {
           // Step 3: Sign action
           const transferAction = await wallet.signAction({
             reference,
-            spends: {
-              '0': { unlockingScript: unlockingScript.toHex() }
-            }
+            spends: { '0': { unlockingScript: unlockingScript.toHex() } },
           });
 
           if (!transferAction.tx) {
@@ -273,7 +272,6 @@ export function useUpdateMaterialToken() {
           console.log(`[ADD] Transferred to server: ${transferredToServerTokenId}`);
 
           // Create WalletP2PKH payment for server mint + merge
-          console.log('Creating WalletP2PKH payment transaction (100 sats)...');
           const { paymentTx, paymentTxId, walletParams } = await createWalletPayment(
             wallet,
             serverIdentityKey,
@@ -281,19 +279,15 @@ export function useUpdateMaterialToken() {
             'Payment for material add and merge'
           );
 
-          console.log('WalletP2PKH payment transaction created:', {
-            txid: paymentTxId,
-            satoshis: 100,
-            walletParams,
-          });
+          console.log('WalletP2PKH payment created:', { txid: paymentTxId, satoshis: 100 });
 
-          // Call server API to mint + merge
           const mergeResponse = await fetch('/api/materials/add-and-merge', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               transferredTokenId: transferredToServerTokenId,
-              transferTransactionId: transferBroadcast.txid,
+              transferBeef: encodeBeef(Array.from(transferAction.tx!)),
+              transferNonce,
               lootTableId: update.lootTableId,
               itemName: update.itemName,
               description: update.description,
@@ -302,9 +296,9 @@ export function useUpdateMaterialToken() {
               tier: update.tier || 1,
               addedQuantity: update.quantity,
               currentQuantity: update.currentQuantity,
-              userPublicKey: publicKey,
-              paymentTx,          // WalletP2PKH payment BEEF
-              walletParams,       // Derivation params for unlocking
+              userIdentityKey,
+              paymentTx: encodeBeef(paymentTx),
+              walletParams,
               reason: update.reason,
               acquiredFrom: update.acquiredFrom,
             }),
@@ -318,6 +312,15 @@ export function useUpdateMaterialToken() {
           const mergeData = await mergeResponse.json();
 
           console.log(`[ADD] Server merged: ${mergeData.mergedTokenId}`);
+
+          // Internalize the merged token non-fatally (recoverable via reindexFromBasket)
+          if (typeof mergeData.transferBeef === 'string' && mergeData.received) {
+            try {
+              await internalizeToBasket(wallet, decodeBeef(mergeData.transferBeef), [mergeData.received], `Receive ${update.itemName}`);
+            } catch (e) {
+              console.warn('Merged material minted server-side but wallet internalize failed (recoverable via reindexFromBasket):', e);
+            }
+          }
 
           results.push({
             lootTableId: update.lootTableId,
@@ -442,9 +445,10 @@ export function useUpdateMaterialToken() {
           // Convert to BSV-21 format (underscore separator)
           const assetId = update.currentTokenId.replace('.', '_');
 
-          // Create new locking script (reuse ordinalP2PKH instance)
+          // Re-lock to the player's monsterbattle protocol key (subtract/set path)
+          const { publicKey: playerPublicKey } = await wallet.getPublicKey({ protocolID: [0, 'monsterbattle'], keyID: '0' });
           const newLockingScript = ordinalP2PKH.lock(
-            publicKey,
+            playerPublicKey,
             assetId,                 // Reference previous token (BSV-21 format)
             updateMetadata,
             "transfer",              // Type: transfer/update
