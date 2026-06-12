@@ -1,26 +1,8 @@
-/**
- * Server-Side Equipment Update with Inscription Scrolls (Batched)
- *
- * This route handles applying inscription scrolls to equipment using the batched transfer-to-server pattern:
- *
- * CLIENT TRANSACTION:
- *   - Single batched transfer: equipment + scroll(s) → server (much cheaper!)
- *   - Payment: WalletP2PKH payment for fees
- *
- * SERVER TRANSACTION:
- *   - Input 0: Transferred equipment token (server unlocks)
- *   - Input 1+: Transferred scroll token(s) (server unlocks)
- *   - Input N: Payment token (server unlocks with WalletP2PKH)
- *   - Output 0: Updated equipment token (transferred back to user)
- *
- * This architecture:
- * - Batched transfers = cheaper transaction fees
- * - Server has full control during operation
- * - Proper on-chain provenance for equipment updates
- * - Scroll consumption verified on-chain
- * - Clean transaction structure
- * - Supports applying multiple scrolls at once (prefix + suffix)
- */
+// Server-side equipment update with inscription scrolls (batched derived-key pattern).
+// Client transfers equipment + scrolls in one batch tx (posted BEEF + shared nonce N2).
+// Server unlocks all transferred inputs with a single shared-derivation template,
+// applies inscriptions, and outputs updated equipment to user's recipient-derived key (N3).
+// Scrolls are consumed (no output). Returns BEEF + N3 for client to internalize.
 
 import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
@@ -29,21 +11,20 @@ import { ObjectId } from 'mongodb';
 import { verifyJWT } from '@/utils/jwt';
 import { Transaction, Beef } from '@bsv/sdk';
 import { WalletP2PKH } from '@bsv/wallet-helper';
-import { getServerWallet } from '@/lib/serverWallet';
+import { getServerWallet, getServerIdentityPublicKey } from '@/lib/serverWallet';
 import { OrdinalsP2PKH } from '@/utils/ordinalP2PKH';
-import { broadcastTX, getTransactionByTxID } from '@/utils/overlayFunctions';
+import { broadcastTX } from '@/utils/overlayFunctions';
+import { decodeBeef, encodeBeef } from '@/utils/beefEncoding';
+import { TOKEN_PROTOCOL, generateNonce, deriveRecipientKey } from '@/utils/tokenDerivation';
 
 export async function POST(request: NextRequest) {
   try {
-    // 1. Verify JWT and get user
+    // 1. Verify JWT
     const cookieStore = await cookies();
     const token = cookieStore.get('verified')?.value;
 
     if (!token) {
-      return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 }
-      );
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
     const payload = await verifyJWT(token);
@@ -54,113 +35,80 @@ export async function POST(request: NextRequest) {
     const {
       originalEquipmentInventoryId,
       originalEquipmentTokenId,
-      inscriptionScrollInventoryIds,    // Array of scroll inventory IDs
-      inscriptionScrollTokenIds,        // Array of scroll token IDs
+      inscriptionScrollInventoryIds,   // Array of scroll inventory IDs
       transferredEquipmentTokenId,
-      transferredScrollTokenIds,        // Array of transferred scroll token IDs
-      batchTransferTransactionId,       // Single transaction ID for batch transfer
+      transferredScrollTokenIds,       // Array of transferred scroll outpoints
+      batchTransferBeef,               // base64 BEEF of client's batch transfer tx
+      transferNonce,                   // N2: shared nonce used to lock all transferred outputs to server; absent ⇒ legacy
+      userIdentityKey,                 // Derivation counterparty (replaces userPublicKey)
       equipmentData,
-      scrollsData,                      // Array of scroll inscription data
       updatedPrefix,
       updatedSuffix,
-      userPublicKey,
-      paymentTx,
+      paymentTx,                       // base64 WalletP2PKH payment BEEF
       walletParams,
     } = body;
 
-    // Validate required fields
-    if (!originalEquipmentInventoryId || !inscriptionScrollInventoryIds || !transferredEquipmentTokenId || !transferredScrollTokenIds || !userPublicKey) {
-      return NextResponse.json(
-        { error: 'Missing required fields' },
-        { status: 400 }
-      );
+    if (!originalEquipmentInventoryId || !inscriptionScrollInventoryIds || !transferredEquipmentTokenId || !transferredScrollTokenIds || !userIdentityKey || !batchTransferBeef) {
+      return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
     }
 
     if (!Array.isArray(inscriptionScrollInventoryIds) || inscriptionScrollInventoryIds.length === 0) {
-      return NextResponse.json(
-        { error: 'At least one inscription scroll required' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'At least one inscription scroll required' }, { status: 400 });
     }
 
     if (inscriptionScrollInventoryIds.length > 2) {
-      return NextResponse.json(
-        { error: 'Maximum 2 inscription scrolls allowed (prefix + suffix)' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'Maximum 2 inscription scrolls allowed (prefix + suffix)' }, { status: 400 });
     }
 
     if (!paymentTx) {
-      return NextResponse.json(
-        { error: 'Missing payment transaction' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'Missing payment transaction' }, { status: 400 });
     }
 
     if (!walletParams || !walletParams.protocolID || !walletParams.keyID || !walletParams.counterparty) {
-      return NextResponse.json(
-        { error: 'Missing wallet derivation parameters' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'Missing wallet derivation parameters' }, { status: 400 });
     }
 
     // 3. Connect to MongoDB
     const { userInventoryCollection, nftLootCollection, playerStatsCollection } = await connectToMongo();
 
-    // 4. Verify user owns the equipment
+    // 4. Verify equipment ownership
     const originalEquipment = await userInventoryCollection.findOne({
       _id: new ObjectId(originalEquipmentInventoryId),
-      userId: userId,
+      userId,
     });
 
     if (!originalEquipment) {
-      return NextResponse.json(
-        { error: 'Original equipment not found or not owned by user' },
-        { status: 404 }
-      );
+      return NextResponse.json({ error: 'Original equipment not found or not owned by user' }, { status: 404 });
     }
 
-    // 5. Verify user owns all scrolls
+    // 5. Verify scroll ownership
     const scrollInventoryIds = inscriptionScrollInventoryIds.map(id => new ObjectId(id));
     const inscriptionScrolls = await userInventoryCollection
-      .find({
-        _id: { $in: scrollInventoryIds },
-        userId: userId,
-      })
+      .find({ _id: { $in: scrollInventoryIds }, userId })
       .toArray();
 
     if (inscriptionScrolls.length !== inscriptionScrollInventoryIds.length) {
-      return NextResponse.json(
-        { error: 'One or more inscription scrolls not found or not owned by user' },
-        { status: 404 }
-      );
+      return NextResponse.json({ error: 'One or more inscription scrolls not found or not owned by user' }, { status: 404 });
     }
 
     // 6. Get server wallet
     const serverWallet = await getServerWallet();
     const ordinalP2PKH = new OrdinalsP2PKH();
 
-    // 7. Parse and validate payment transaction
-    const paymentTransaction = Transaction.fromBEEF(paymentTx);
+    // 7. Parse payment and batch transfer transactions
+    const paymentBeef = decodeBeef(paymentTx);
+    const paymentTransaction = Transaction.fromBEEF(paymentBeef);
     const paymentTxId = paymentTransaction.id('hex');
 
-    console.log('📥 [PAYMENT] Received WalletP2PKH payment transaction:', {
-      txid: paymentTxId,
-      walletParams,
-    });
+    console.log('📥 [PAYMENT] Received WalletP2PKH payment transaction:', { txid: paymentTxId, walletParams });
 
-    // Validate payment amount
     const paymentOutput = paymentTransaction.outputs[0];
     if (!paymentOutput || !paymentOutput.satoshis || paymentOutput.satoshis < 100) {
-      return NextResponse.json(
-        { error: 'Invalid payment: must be at least 100 satoshis' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'Invalid payment: must be at least 100 satoshis' }, { status: 400 });
     }
 
     const paymentOutpoint = `${paymentTxId}.0`;
 
-    // Create WalletP2PKH unlocking script template
     const walletp2pkh = new WalletP2PKH(serverWallet);
     const walletP2pkhUnlockTemplate = walletp2pkh.unlock({
       protocolID: walletParams.protocolID,
@@ -169,52 +117,37 @@ export async function POST(request: NextRequest) {
     });
     const walletP2pkhUnlockingLength = await walletP2pkhUnlockTemplate.estimateLength();
 
-    console.log('🔓 [PAYMENT] Created WalletP2PKH unlock template:', {
-      unlockingScriptLength: walletP2pkhUnlockingLength,
-      paymentOutpoint,
-      paymentAmount: paymentOutput.satoshis,
-    });
-
     console.log('Server updating equipment (batched):', {
       equipmentName: equipmentData.name,
       scrollCount: inscriptionScrollInventoryIds.length,
-      scrollNames: scrollsData.map((s: any) => s.name),
       transferredEquipmentTokenId,
       transferredScrollTokenIds,
-      batchTransferTransactionId,
       userId,
       paymentAmount: paymentOutput.satoshis,
     });
 
-    // ========================================
-    // STEP 1: Validate batched transfer transaction
-    // ========================================
+    // Decode batch transfer BEEF (no overlay fetch)
+    const batchTransferTransaction = Transaction.fromBEEF(decodeBeef(batchTransferBeef));
 
-    // Fetch the single batched transfer transaction
-    const batchTransferTxData = await getTransactionByTxID(batchTransferTransactionId);
-    if (!batchTransferTxData || !batchTransferTxData.outputs || !batchTransferTxData.outputs[0] || !batchTransferTxData.outputs[0].beef) {
-      return NextResponse.json(
-        { error: `Could not find batch transfer transaction: ${batchTransferTransactionId}` },
-        { status: 404 }
-      );
-    }
-
-    const batchTransferTransaction = Transaction.fromBEEF(batchTransferTxData.outputs[0].beef);
-
-    console.log('✅ [VALIDATE] Batch transfer transaction validated:', {
-      txid: batchTransferTransactionId,
+    console.log('✅ [VALIDATE] Batch transfer transaction decoded:', {
       outputs: batchTransferTransaction.outputs.length,
     });
 
-    // ========================================
-    // STEP 2: Create update transaction
-    // ========================================
-
-    // Create unlocking script template for ordinal tokens
-    const unlockTemplate = ordinalP2PKH.unlock(serverWallet, "all", false);
+    // Single unlock template shared by all transferred ordinal inputs (they share N2)
+    const unlockTemplate = ordinalP2PKH.unlock(
+      serverWallet, 'all', false, undefined, undefined,
+      transferNonce
+        ? { protocolID: TOKEN_PROTOCOL, keyID: transferNonce, counterparty: userIdentityKey }
+        : undefined, // legacy: fixed key
+    );
     const unlockingScriptLength = await unlockTemplate.estimateLength();
 
-    // Prepare updated equipment metadata
+    // Derive user recipient key for the updated equipment output
+    const serverIdentityKey = await getServerIdentityPublicKey();
+    const N3 = generateNonce();
+    const userKey = await deriveRecipientKey(serverWallet, userIdentityKey, N3);
+
+    // Build updated equipment metadata and locking script
     const updatedEquipmentMetadata = {
       name: 'game_item',
       itemName: equipmentData.name,
@@ -225,35 +158,23 @@ export async function POST(request: NextRequest) {
       tier: equipmentData.tier,
       stats: equipmentData.equipmentStats,
       crafted: equipmentData.crafted || null,
-      enhancements: {
-        prefix: updatedPrefix,
-        suffix: updatedSuffix,
-      },
-      visual: {
-        borderGradient: equipmentData.borderGradient,
-      },
+      enhancements: { prefix: updatedPrefix, suffix: updatedSuffix },
+      visual: { borderGradient: equipmentData.borderGradient },
     };
 
-    // Reference the original equipment token (not the transferred one)
     const assetId = originalEquipmentTokenId.replace('.', '_');
-
     const updatedEquipmentLockingScript = ordinalP2PKH.lock(
-      userPublicKey,
+      userKey,
       assetId,
       updatedEquipmentMetadata,
       'transfer'
     );
 
-    // Build inputs array: equipment + scrolls + payment
+    // Build inputs: equipment + scrolls (shared unlock template) + payment
     const inputs = [
-      {
-        inputDescription: "Transferred equipment token",
-        outpoint: transferredEquipmentTokenId,
-        unlockingScriptLength,
-      },
+      { inputDescription: 'Transferred equipment token', outpoint: transferredEquipmentTokenId, unlockingScriptLength },
     ];
 
-    // Add scroll inputs
     for (let i = 0; i < transferredScrollTokenIds.length; i++) {
       inputs.push({
         inputDescription: `Transferred scroll token ${i + 1}`,
@@ -262,9 +183,8 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    // Add payment input
     inputs.push({
-      inputDescription: "User WalletP2PKH payment for fees",
+      inputDescription: 'User WalletP2PKH payment for fees',
       outpoint: paymentOutpoint,
       unlockingScriptLength: walletP2pkhUnlockingLength,
     });
@@ -274,71 +194,54 @@ export async function POST(request: NextRequest) {
       equipment: transferredEquipmentTokenId,
       scrolls: transferredScrollTokenIds,
       payment: paymentOutpoint,
-      output: 'Updated equipment to user',
     });
 
-    // Merge BEEFs for multiple inputs
     const mergedBeef = new Beef();
     mergedBeef.mergeBeef(batchTransferTransaction.toBEEF());
     mergedBeef.mergeBeef(paymentTransaction.toBEEF());
     const inputBEEF = mergedBeef.toBinary();
 
-    // Create update transaction: N inputs → 1 output
     const updateActionRes = await serverWallet.createAction({
       description: `Updating equipment with ${inscriptionScrollInventoryIds.length} inscription scroll(s)`,
       inputBEEF,
       inputs,
       outputs: [{
-        outputDescription: "Updated equipment back to user",
+        outputDescription: 'Updated equipment back to user',
         lockingScript: updatedEquipmentLockingScript.toHex(),
         satoshis: 1,
       }],
-      options: {
-        randomizeOutputs: false,
-        acceptDelayedBroadcast: false,
-      },
+      options: { randomizeOutputs: false, acceptDelayedBroadcast: false },
     });
 
     if (!updateActionRes.signableTransaction) {
       throw new Error('Failed to create signable update transaction');
     }
 
-    // Sign the update transaction
     const reference = updateActionRes.signableTransaction.reference;
     const txToSign = Transaction.fromBEEF(updateActionRes.signableTransaction.tx);
 
-    // Add unlocking script templates for all inputs
-    // Inputs 0 to N-2: Equipment and scrolls (use ordinal unlock template)
+    // Apply shared unlock template to all ordinal inputs (0..N-2); payment gets WalletP2PKH
     for (let i = 0; i < inputs.length - 1; i++) {
       txToSign.inputs[i].unlockingScriptTemplate = unlockTemplate;
       txToSign.inputs[i].sourceTransaction = batchTransferTransaction;
     }
 
-    // Input N-1: Payment (use WalletP2PKH unlock template)
     const paymentInputIndex = inputs.length - 1;
     txToSign.inputs[paymentInputIndex].unlockingScriptTemplate = walletP2pkhUnlockTemplate;
     txToSign.inputs[paymentInputIndex].sourceTransaction = paymentTransaction;
 
     await txToSign.sign();
 
-    // Extract unlocking scripts
     const spends: Record<string, any> = {};
     for (let i = 0; i < inputs.length; i++) {
       const unlockingScript = txToSign.inputs[i].unlockingScript;
-      if (!unlockingScript) {
-        throw new Error(`Missing unlocking script for input ${i}`);
-      }
+      if (!unlockingScript) throw new Error(`Missing unlocking script for input ${i}`);
       spends[String(i)] = { unlockingScript: unlockingScript.toHex() };
     }
 
-    const updateAction = await serverWallet.signAction({
-      reference,
-      spends,
-    });
+    const updateAction = await serverWallet.signAction({ reference, spends });
 
-    if (!updateAction.tx) {
-      throw new Error('Failed to sign update action');
-    }
+    if (!updateAction.tx) throw new Error('Failed to sign update action');
 
     const updateTx = Transaction.fromAtomicBEEF(updateAction.tx);
     const updateBroadcast = await broadcastTX(updateTx);
@@ -347,16 +250,9 @@ export async function POST(request: NextRequest) {
 
     console.log(`✅ [UPDATE] Updated equipment: ${updatedEquipmentTokenId}`);
 
-    // ========================================
-    // STEP 3: Update database
-    // ========================================
+    // Update database: preserve mint proof, add keyId/counterparty
+    const originalNFTLoot = await nftLootCollection.findOne({ _id: originalEquipment.nftLootId });
 
-    // Fetch original NFTLoot to preserve mint proof
-    const originalNFTLoot = await nftLootCollection.findOne({
-      _id: originalEquipment.nftLootId
-    });
-
-    // Create new NFTLoot document for updated equipment
     const updatedEquipmentDoc = {
       lootTableId: equipmentData.lootTableId,
       name: equipmentData.name,
@@ -364,28 +260,28 @@ export async function POST(request: NextRequest) {
       icon: equipmentData.icon,
       rarity: equipmentData.rarity,
       type: equipmentData.type,
-      attributes: {
-        ...updatedEquipmentMetadata,
-        borderGradient: equipmentData.borderGradient,
-      },
-      mintOutpoint: originalNFTLoot?.mintOutpoint,  // Preserve original mint proof
-      tokenId: updatedEquipmentTokenId,              // Current location after update
-      userId: userId,
+      attributes: { ...updatedEquipmentMetadata, borderGradient: equipmentData.borderGradient },
+      mintOutpoint: originalNFTLoot?.mintOutpoint, // preserve original mint proof
+      tokenId: updatedEquipmentTokenId,
+      keyId: N3,
+      counterparty: serverIdentityKey,
+      userId,
       createdAt: new Date(),
     };
 
     const nftResult = await nftLootCollection.insertOne(updatedEquipmentDoc);
     const nftId = nftResult.insertedId.toString();
 
-    // Create new UserInventory entry for updated equipment (preserve ALL original fields)
     const newInventoryEntry = {
-      userId: userId,
+      userId,
       lootTableId: equipmentData.lootTableId,
       itemType: equipmentData.type,
       nftLootId: nftResult.insertedId,
-      mintOutpoint: originalNFTLoot?.mintOutpoint, // Preserve original mint proof
-      tokenId: updatedEquipmentTokenId,             // Current location after update
+      mintOutpoint: originalNFTLoot?.mintOutpoint, // preserve original mint proof
+      tokenId: updatedEquipmentTokenId,
       transactionId: updateTxId,
+      keyId: N3,
+      counterparty: serverIdentityKey,
       tier: equipmentData.tier || originalEquipment.tier,
       borderGradient: equipmentData.borderGradient || originalEquipment.borderGradient,
       prefix: updatedPrefix,
@@ -394,18 +290,15 @@ export async function POST(request: NextRequest) {
       fromMonsterId: originalEquipment.fromMonsterId,
       fromSessionId: originalEquipment.fromSessionId,
       updatedFrom: originalEquipmentInventoryId,
-      // Preserve crafting data if present
       crafted: originalEquipment.crafted,
       statRoll: originalEquipment.statRoll,
-      // Preserve empowered status if present
       isEmpowered: originalEquipment.isEmpowered,
-      // Preserve any other custom fields
       enhanced: originalEquipment.enhanced,
     };
 
     const inventoryResult = await userInventoryCollection.insertOne(newInventoryEntry);
 
-    // Check if the old equipment was equipped, and update PlayerStats if so
+    // Auto-update equipped slot references if old item was equipped
     const oldEquipmentId = new ObjectId(originalEquipmentInventoryId);
     const newEquipmentId = inventoryResult.insertedId;
     let wasEquipped = false;
@@ -414,44 +307,22 @@ export async function POST(request: NextRequest) {
     if (playerStats) {
       const updateFields: any = {};
 
-      // Check each equipment slot and update if it references the old item
-      if (playerStats.equippedWeapon?.equals(oldEquipmentId)) {
-        updateFields.equippedWeapon = newEquipmentId;
-        wasEquipped = true;
-      }
-      if (playerStats.equippedArmor?.equals(oldEquipmentId)) {
-        updateFields.equippedArmor = newEquipmentId;
-        wasEquipped = true;
-      }
-      if (playerStats.equippedAccessory1?.equals(oldEquipmentId)) {
-        updateFields.equippedAccessory1 = newEquipmentId;
-        wasEquipped = true;
-      }
-      if (playerStats.equippedAccessory2?.equals(oldEquipmentId)) {
-        updateFields.equippedAccessory2 = newEquipmentId;
-        wasEquipped = true;
-      }
+      if (playerStats.equippedWeapon?.equals(oldEquipmentId)) { updateFields.equippedWeapon = newEquipmentId; wasEquipped = true; }
+      if (playerStats.equippedArmor?.equals(oldEquipmentId)) { updateFields.equippedArmor = newEquipmentId; wasEquipped = true; }
+      if (playerStats.equippedAccessory1?.equals(oldEquipmentId)) { updateFields.equippedAccessory1 = newEquipmentId; wasEquipped = true; }
+      if (playerStats.equippedAccessory2?.equals(oldEquipmentId)) { updateFields.equippedAccessory2 = newEquipmentId; wasEquipped = true; }
 
-      // Update PlayerStats if any slot was referencing the old item
       if (Object.keys(updateFields).length > 0) {
-        await playerStatsCollection.updateOne(
-          { userId },
-          { $set: updateFields }
-        );
+        await playerStatsCollection.updateOne({ userId }, { $set: updateFields });
         console.log('✅ [EQUIPMENT] Auto-updated equipped item references:', updateFields);
       }
     }
 
-    // Delete original equipment (provenance is on-chain and in Overlay system)
-    await userInventoryCollection.deleteOne(
-      { _id: oldEquipmentId }
-    );
+    // Delete original equipment and consumed scrolls (provenance is on-chain)
+    await userInventoryCollection.deleteOne({ _id: oldEquipmentId });
 
-    // Delete all consumed inscription scrolls (provenance is on-chain and in Overlay system)
     for (const scrollInventoryId of inscriptionScrollInventoryIds) {
-      await userInventoryCollection.deleteOne(
-        { _id: new ObjectId(scrollInventoryId), userId }
-      );
+      await userInventoryCollection.deleteOne({ _id: new ObjectId(scrollInventoryId), userId });
     }
 
     console.log('✅ [DATABASE] Updated equipment documents:', {
@@ -461,11 +332,18 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      nftId: nftId,
+      nftId,
       tokenId: updatedEquipmentTokenId,
       transactionId: updateTxId,
       newInventoryItemId: inventoryResult.insertedId.toString(),
-      wasEquipped, // True if item was equipped and reference was auto-updated
+      wasEquipped,
+      transferBeef: encodeBeef(Array.from(updateAction.tx!)),
+      received: {
+        outputIndex: 0,
+        keyId: N3,
+        counterparty: serverIdentityKey,
+        tags: ['type:equipment'],
+      },
     });
 
   } catch (error) {

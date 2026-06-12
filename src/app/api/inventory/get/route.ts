@@ -85,9 +85,11 @@ export async function GET(request: NextRequest) {
         statRoll: inventoryItem.statRoll, // Stat roll multiplier (0.8 to 1.2) for crafted items
         isEmpowered: inventoryItem.isEmpowered, // True if from corrupted monster (+20% stats)
         equipmentStats: lootTemplate.equipmentStats, // Include equipment stats for display
-        prefix: inventoryItem.prefix, // Phase 3.4: Prefix inscription
-        suffix: inventoryItem.suffix, // Phase 3.4: Suffix inscription
-        enhanced: inventoryItem.enhanced || false // Phase 3.5: Enhanced consumables (infinite uses)
+        prefix: inventoryItem.prefix,
+        suffix: inventoryItem.suffix,
+        enhanced: inventoryItem.enhanced || false,
+        keyId: inventoryItem.keyId,
+        counterparty: inventoryItem.counterparty,
       };
     }).filter(item => item !== null); // Filter out any items not found
 
@@ -166,14 +168,16 @@ export async function GET(request: NextRequest) {
         borderGradient: undefined, // Materials don't have gradients
         isMinted: !!token.tokenId, // True if on blockchain
         quantity: token.quantity, // Material token quantity
-        isMaterialToken: true, // Flag to distinguish from regular inventory items
+        isMaterialToken: true,
         crafted: false,
         statRoll: undefined,
         isEmpowered: false,
         equipmentStats: undefined,
         prefix: undefined,
         suffix: undefined,
-        enhanced: false
+        enhanced: false,
+        keyId: token.keyId,
+        counterparty: token.counterparty,
       };
     }).filter(item => item !== null);
 

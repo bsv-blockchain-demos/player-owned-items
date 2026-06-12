@@ -1,50 +1,31 @@
-/**
- * Server-Side Crafting: Transfer-to-Server Pattern
- *
- * This route handles crafting using the transfer-to-server pattern:
- *
- * CLIENT TRANSACTIONS (user → server):
- *   - For each material: Transfer token to server (amt=quantity, locked to server pubkey)
- *
- * SERVER TRANSACTION 1 (mint crafted item):
- *   - No inputs (coinbase-style)
- *   - Output: Crafted item (amt=1, owned by server)
- *
- * SERVER TRANSACTION 2 (transfer all to user):
- *   - Inputs: All transferred materials + crafted item (server unlocks)
- *   - Outputs: Crafted item to user + material change tokens to user (with reduced amt)
- *
- * This architecture:
- * - Server has full control during operation
- * - Proper BSV-20 amt field usage for materials
- * - Material changes reuse original tokens (no unnecessary mints)
- * - Maintains token provenance chain
- * - Clean on-chain provenance
- * - Simpler than auth-based pattern
- */
+// Server-side crafting: derived-key transfer-to-server pattern (multi-input + multi-output).
+// Client batches ALL materials into ONE transfer tx locked to a server recipient-derived key
+// using a single shared nonce N2, then POSTs that tx's BEEF + N2.
+// Server: validates transferred materials (shared N2), mints crafted item to a self-derived
+// key (mintNonce), then in one transfer tx consumes [materials + crafted item] and outputs
+// [crafted item → user (N3_item) + each material change → user (N3_change_i)].
+// Returns BEEF + received[] for client to internalize all outputs.
 
 import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 import { verifyJWT } from '@/utils/jwt';
 import { connectToMongo } from '@/lib/mongodb';
-import { getServerWallet, getServerPublicKey } from '@/lib/serverWallet';
+import { getServerWallet, getServerPublicKey, getServerIdentityPublicKey } from '@/lib/serverWallet';
 import { OrdinalsP2PKH } from '@/utils/ordinalP2PKH';
-import { Transaction, P2PKH, Beef } from '@bsv/sdk';
+import { Transaction, P2PKH, Beef, Hash } from '@bsv/sdk';
 import { WalletP2PKH } from '@bsv/wallet-helper';
-import { ObjectId } from 'mongodb';
-import { broadcastTX, getTransactionByTxID } from '@/utils/overlayFunctions';
+import { broadcastTX } from '@/utils/overlayFunctions';
+import { decodeBeef, encodeBeef } from '@/utils/beefEncoding';
+import { TOKEN_PROTOCOL, generateNonce, deriveRecipientKey, deriveSelfKey } from '@/utils/tokenDerivation';
 
 export async function POST(request: NextRequest) {
   try {
-    // 1. Verify JWT and get user
+    // 1. Verify JWT
     const cookieStore = await cookies();
     const token = cookieStore.get('verified')?.value;
 
     if (!token) {
-      return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 }
-      );
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
     const payload = await verifyJWT(token);
@@ -54,80 +35,54 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const {
       recipeId,
-      transferredMaterials,  // Array of {lootTableId, tokenId, transactionId, quantity, quantityNeeded, ...}
-      inputItems,
+      transferredMaterials,   // Array of {lootTableId, tokenId, quantity, quantityNeeded, itemName, description, icon, rarity, tier}
       outputItem,
-      userPublicKey,
-      paymentTx,        // User's payment transaction BEEF (WalletP2PKH locked)
-      walletParams,     // Wallet derivation params for unlocking { protocolID, keyID, counterparty }
+      userIdentityKey,        // replaces userPublicKey; derivation counterparty
+      paymentTx,              // base64 WalletP2PKH payment BEEF
+      batchTransferBeef,      // base64 BEEF of client's single batch transfer (replaces per-material overlay fetch)
+      transferNonce,          // N2: shared nonce client used to lock all materials to server
+      walletParams,
     } = body;
 
-    // Validate required fields
     if (!transferredMaterials || !Array.isArray(transferredMaterials) || transferredMaterials.length === 0) {
-      return NextResponse.json(
-        { error: 'Missing or invalid transferredMaterials' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'Missing or invalid transferredMaterials' }, { status: 400 });
     }
 
-    if (!outputItem || !userPublicKey) {
-      return NextResponse.json(
-        { error: 'Missing required fields' },
-        { status: 400 }
-      );
+    if (!outputItem || !userIdentityKey) {
+      return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
     }
 
     if (!paymentTx) {
-      return NextResponse.json(
-        { error: 'Missing payment transaction' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'Missing payment transaction' }, { status: 400 });
+    }
+
+    if (!batchTransferBeef) {
+      return NextResponse.json({ error: 'Missing batch transfer BEEF' }, { status: 400 });
     }
 
     if (!walletParams || !walletParams.protocolID || !walletParams.keyID || !walletParams.counterparty) {
-      return NextResponse.json(
-        { error: 'Missing wallet derivation parameters' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'Missing wallet derivation parameters' }, { status: 400 });
     }
 
     // 3. Connect to MongoDB
     const { userInventoryCollection, nftLootCollection, materialTokensCollection } = await connectToMongo();
 
-    // 4. Get server wallet and public key
+    // 4. Get server wallet
     const serverWallet = await getServerWallet();
-    const serverPublicKey = await getServerPublicKey();
     const ordinalP2PKH = new OrdinalsP2PKH();
 
-    // 5. Parse and validate payment transaction
-    const paymentTransaction = Transaction.fromBEEF(paymentTx);
+    // 5. Parse payment transaction
+    const paymentBeef = decodeBeef(paymentTx);
+    const paymentTransaction = Transaction.fromBEEF(paymentBeef);
     const paymentTxId = paymentTransaction.id('hex');
 
-    console.log('📥 [PAYMENT] Received WalletP2PKH payment transaction:', {
-      txid: paymentTxId,
-      walletParams,
-    });
-
-    console.log('📥 [PAYMENT] Parsed payment transaction:', {
-      txid: paymentTxId,
-      inputs: paymentTransaction.inputs.length,
-      outputs: paymentTransaction.outputs.length,
-      output0Satoshis: paymentTransaction.outputs[0]?.satoshis,
-      output0Script: paymentTransaction.outputs[0]?.lockingScript.toHex(),
-    });
-
-    // Find output locked to server with WalletP2PKH (should be output 0)
     const paymentOutput = paymentTransaction.outputs[0];
     if (!paymentOutput || !paymentOutput.satoshis || paymentOutput.satoshis < 100) {
-      return NextResponse.json(
-        { error: 'Invalid payment: must be at least 100 satoshis' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'Invalid payment: must be at least 100 satoshis' }, { status: 400 });
     }
 
     const paymentOutpoint = `${paymentTxId}.0`;
 
-    // Create WalletP2PKH unlocking script template using wallet params from client
     const walletp2pkh = new WalletP2PKH(serverWallet);
     const walletP2pkhUnlockTemplate = walletp2pkh.unlock({
       protocolID: walletParams.protocolID,
@@ -136,63 +91,41 @@ export async function POST(request: NextRequest) {
     });
     const walletP2pkhUnlockingLength = await walletP2pkhUnlockTemplate.estimateLength();
 
-    console.log('🔓 [PAYMENT] Created WalletP2PKH unlock template:', {
-      unlockingScriptLength: walletP2pkhUnlockingLength,
-      paymentOutpoint,
-      protocolID: walletParams.protocolID,
-      keyID: walletParams.keyID,
-      counterparty: walletParams.counterparty,
-    });
-
-    console.log('Server crafting with transfer-to-server:', {
+    console.log('Server crafting (derived-key):', {
       recipeId,
       materialCount: transferredMaterials.length,
       outputName: outputItem.name,
       userId,
       paymentAmount: paymentOutput.satoshis,
-      paymentOutpoint,
     });
 
-    // ========================================
-    // STEP 1: Validate transferred material tokens
-    // ========================================
+    // 6. Parse batch transfer BEEF once — all material outputs live in this tx
+    const batchTransferTransaction = Transaction.fromBEEF(decodeBeef(batchTransferBeef));
 
+    // Derive the server key all materials were locked to (shared N2)
+    const expectedServerKey = transferNonce
+      ? (await serverWallet.getPublicKey({
+          protocolID: TOKEN_PROTOCOL,
+          keyID: transferNonce,
+          counterparty: userIdentityKey,
+          forSelf: true,
+        })).publicKey
+      : await getServerPublicKey(); // legacy fallback
+    // OrdinalsP2PKH embeds hash160(pubkey), not raw pubkey hex
+    const expectedScriptPattern = new P2PKH().lock(Hash.hash160(expectedServerKey, 'hex')).toHex();
+
+    // 7. Validate each transferred material output
     for (const material of transferredMaterials) {
-      const transferTxData = await getTransactionByTxID(material.transactionId);
-
-      if (!transferTxData || !transferTxData.outputs || !transferTxData.outputs[0] || !transferTxData.outputs[0].beef) {
-        return NextResponse.json(
-          { error: `Could not find transfer transaction: ${material.transactionId}` },
-          { status: 404 }
-        );
-      }
-
-      const transferTransaction = Transaction.fromBEEF(transferTxData.outputs[0].beef);
-
-      // Verify transferred output is locked to server public key
-      const transferOutputIndex = parseInt(material.tokenId.split('.')[1]);
-      const transferOutput = transferTransaction.outputs[transferOutputIndex];
+      const vout = parseInt(material.tokenId.split('.')[1]);
+      const transferOutput = batchTransferTransaction.outputs[vout];
 
       if (!transferOutput) {
-        return NextResponse.json(
-          { error: `Transfer output not found: ${material.tokenId}` },
-          { status: 404 }
-        );
+        return NextResponse.json({ error: `Transfer output not found: ${material.tokenId}` }, { status: 404 });
       }
 
-      // Extract the P2PKH portion to validate public key
-      const transferScriptHex = transferOutput.lockingScript.toHex();
-      const expectedScriptPattern = new P2PKH().lock(serverPublicKey).toHex();
-
-      console.log('🔍 [VALIDATE] Validating transferred material:', {
-        lootTableId: material.lootTableId,
-        tokenId: material.tokenId,
-        containsExpectedP2PKH: transferScriptHex.includes(expectedScriptPattern),
-      });
-
-      if (!transferScriptHex.includes(expectedScriptPattern)) {
+      if (!transferOutput.lockingScript.toHex().includes(expectedScriptPattern)) {
         return NextResponse.json(
-          { error: `Material ${material.lootTableId} not locked to server public key` },
+          { error: `Material ${material.lootTableId} not locked to server derived key` },
           { status: 400 }
         );
       }
@@ -200,10 +133,7 @@ export async function POST(request: NextRequest) {
 
     console.log('✅ [VALIDATE] All transferred materials validated');
 
-    // ========================================
-    // STEP 2: Calculate material consumption and change
-    // ========================================
-
+    // 8. Calculate material change amounts
     const materialChanges: Array<{
       lootTableId: string;
       itemName: string;
@@ -216,7 +146,6 @@ export async function POST(request: NextRequest) {
 
     for (const material of transferredMaterials) {
       if (material.quantity > material.quantityNeeded) {
-        const changeAmount = material.quantity - material.quantityNeeded;
         materialChanges.push({
           lootTableId: material.lootTableId,
           itemName: material.itemName,
@@ -224,9 +153,8 @@ export async function POST(request: NextRequest) {
           icon: material.icon,
           rarity: material.rarity,
           tier: material.tier,
-          changeAmount,
+          changeAmount: material.quantity - material.quantityNeeded,
         });
-        console.log(`🔄 [CHANGE] Material ${material.lootTableId}: ${material.quantity} - ${material.quantityNeeded} = ${changeAmount} change`);
       } else if (material.quantity < material.quantityNeeded) {
         return NextResponse.json(
           { error: `Insufficient ${material.lootTableId}: need ${material.quantityNeeded}, have ${material.quantity}` },
@@ -235,12 +163,7 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    console.log(`✅ [CHANGE] Calculated material changes: ${materialChanges.length} materials need change`);
-
-    // ========================================
-    // STEP 3: Mint crafted item
-    // ========================================
-
+    // 9. Mint crafted item to a server self-derived key
     const craftedItemMetadata = {
       name: 'game_item',
       itemName: outputItem.name,
@@ -251,286 +174,196 @@ export async function POST(request: NextRequest) {
       tier: outputItem.tier || 1,
       stats: outputItem.equipmentStats || {},
       crafted: outputItem.crafted || null,
-      enhancements: {
-        prefix: null,
-        suffix: null,
-      },
-      visual: {
-        borderGradient: outputItem.borderGradient,
-      },
+      enhancements: { prefix: null, suffix: null },
+      visual: { borderGradient: outputItem.borderGradient },
       acquiredFrom: null,
       craftingProof: {
         recipeId,
         materialTokens: transferredMaterials.map(m => m.tokenId),
-      }
+      },
     };
 
-    console.log('🔨 [MINT-CRAFT] Minting crafted item with WalletP2PKH payment:', outputItem.name);
+    const mintNonce = generateNonce();
+    const craftedKey = await deriveSelfKey(serverWallet, mintNonce);
+    const craftedItemLockingScript = ordinalP2PKH.lock(craftedKey, '', craftedItemMetadata, 'deploy+mint', 1);
 
-    const craftedItemLockingScript = ordinalP2PKH.lock(
-      serverPublicKey,
-      '',
-      craftedItemMetadata,
-      'deploy+mint',
-      1  // Items always have amt=1
-    );
+    console.log('🔨 [MINT-CRAFT] Minting crafted item to self-derived key:', outputItem.name);
 
-    // Step 1: Call createAction with unlockingScriptLength
     const craftedItemMintActionRes = await serverWallet.createAction({
-      description: "Minting crafted item with user WalletP2PKH payment",
-      inputBEEF: paymentTx,
-      inputs: [
-        {
-          inputDescription: "User WalletP2PKH payment for fees",
-          outpoint: paymentOutpoint,
-          unlockingScriptLength: walletP2pkhUnlockingLength,
-        }
-      ],
+      description: 'Minting crafted item with user WalletP2PKH payment',
+      inputBEEF: paymentBeef,
+      inputs: [{
+        inputDescription: 'User WalletP2PKH payment for fees',
+        outpoint: paymentOutpoint,
+        unlockingScriptLength: walletP2pkhUnlockingLength,
+      }],
       outputs: [{
-        outputDescription: "Crafted item",
+        outputDescription: 'Crafted item (self-derived key)',
         lockingScript: craftedItemLockingScript.toHex(),
         satoshis: 1,
       }],
-      options: {
-        randomizeOutputs: false,
-        acceptDelayedBroadcast: false,
-      },
+      options: { randomizeOutputs: false, acceptDelayedBroadcast: false },
     });
 
     if (!craftedItemMintActionRes.signableTransaction) {
       throw new Error('Failed to create signable crafted item mint transaction');
     }
 
-    // Step 2: Extract signable transaction and sign it
     const craftedItemMintReference = craftedItemMintActionRes.signableTransaction.reference;
     const craftedItemTxToSign = Transaction.fromBEEF(craftedItemMintActionRes.signableTransaction.tx);
 
-    // Add WalletP2PKH unlocking script template and source transaction
     craftedItemTxToSign.inputs[0].unlockingScriptTemplate = walletP2pkhUnlockTemplate;
     craftedItemTxToSign.inputs[0].sourceTransaction = paymentTransaction;
-
-    // Sign the transaction
     await craftedItemTxToSign.sign();
 
-    // Extract the unlocking script
     const craftedItemUnlockingScript = craftedItemTxToSign.inputs[0].unlockingScript;
-    if (!craftedItemUnlockingScript) {
-      throw new Error('Missing unlocking script after signing crafted item');
-    }
+    if (!craftedItemUnlockingScript) throw new Error('Missing unlocking script after signing crafted item');
 
-    console.log('🔓 [MINT-CRAFT] Transaction signed, WalletP2PKH unlocking script generated:', {
-      scriptLength: craftedItemUnlockingScript.toHex().length,
-      scriptHex: craftedItemUnlockingScript.toHex(),
-    });
-
-    // Step 3: Sign the action with actual unlocking scripts
     const craftedItemMintAction = await serverWallet.signAction({
       reference: craftedItemMintReference,
-      spends: {
-        '0': { unlockingScript: craftedItemUnlockingScript.toHex() }
-      }
+      spends: { '0': { unlockingScript: craftedItemUnlockingScript.toHex() } },
     });
 
-    if (!craftedItemMintAction.tx) {
-      throw new Error('Failed to sign crafted item mint action');
-    }
+    if (!craftedItemMintAction.tx) throw new Error('Failed to sign crafted item mint action');
 
     const craftedItemTx = Transaction.fromAtomicBEEF(craftedItemMintAction.tx);
     const craftedItemBroadcast = await broadcastTX(craftedItemTx);
     const craftedItemTxId = craftedItemBroadcast.txid!;
     const craftedItemOutpoint = `${craftedItemTxId}.0`;
 
-    console.log(`✅ [MINT-CRAFT] Minted crafted item with payment: ${craftedItemOutpoint}`);
+    console.log(`✅ [MINT-CRAFT] Minted crafted item: ${craftedItemOutpoint}`);
 
-    // ========================================
-    // STEP 4: Prepare material change references (no new mints needed)
-    // ========================================
-    // We'll transfer the original material tokens back to the user with updated quantities
-    // This is more efficient than minting new tokens and maintains provenance
+    // 10. Transfer tx: [materials + crafted item] → [crafted item to user + change tokens to user]
 
-    const changeOutpoints: Array<{
-      lootTableId: string;
-      outpoint: string;  // Original tokenId from transferredMaterials
-      amount: number;
-    }> = [];
+    const serverIdentityKey = await getServerIdentityPublicKey();
 
-    for (const change of materialChanges) {
-      // Find the original transferred material
-      const originalMaterial = transferredMaterials.find(m => m.lootTableId === change.lootTableId);
-      if (!originalMaterial) {
-        throw new Error(`Could not find original transferred material for ${change.lootTableId}`);
-      }
+    // Shared unlock template for all transferred materials (N2)
+    const materialsUnlockTemplate = ordinalP2PKH.unlock(
+      serverWallet, 'all', false, undefined, undefined,
+      transferNonce
+        ? { protocolID: TOKEN_PROTOCOL, keyID: transferNonce, counterparty: userIdentityKey }
+        : undefined,
+    );
+    const materialsUnlockLength = await materialsUnlockTemplate.estimateLength();
 
-      changeOutpoints.push({
-        lootTableId: change.lootTableId,
-        outpoint: originalMaterial.tokenId,  // Use original tokenId
-        amount: change.changeAmount,
-      });
+    // Separate unlock template for crafted item (mintNonce, self)
+    const craftedUnlockTemplate = ordinalP2PKH.unlock(
+      serverWallet, 'all', false, undefined, undefined,
+      { protocolID: TOKEN_PROTOCOL, keyID: mintNonce, counterparty: 'self' },
+    );
+    const craftedUnlockLength = await craftedUnlockTemplate.estimateLength();
 
-      console.log(`🔄 [CHANGE] Will transfer original token back: ${change.lootTableId} (amt=${change.changeAmount})`);
-    }
-
-    // ========================================
-    // STEP 5: Transfer all to user (crafted item + material changes with reduced amt)
-    // ========================================
-
-    console.log('🔀 [TRANSFER] Creating transfer transaction: Original materials + Crafted item → Crafted item + Changes to user');
-
-    const unlockTemplate = ordinalP2PKH.unlock(serverWallet, "all", false);
-    const unlockingScriptLength = await unlockTemplate.estimateLength();
-
-    // Fetch all source transactions and build inputs array
-    const sourceTransactions: Transaction[] = [];
-    const inputs: any[] = [];
-
-    // Add transferred material inputs
+    // Build inputs: all materials first, then crafted item
+    const transferInputs: any[] = [];
     for (const material of transferredMaterials) {
-      const txData = await getTransactionByTxID(material.transactionId);
-      if (!txData || !txData.outputs || !txData.outputs[0]) {
-        throw new Error(`Could not find material transfer transaction: ${material.transactionId}`);
-      }
-      const tx = Transaction.fromBEEF(txData.outputs[0].beef);
-      sourceTransactions.push(tx);
-      inputs.push({
+      transferInputs.push({
         inputDescription: `Material: ${material.lootTableId}`,
         outpoint: material.tokenId,
-        unlockingScriptLength,
+        unlockingScriptLength: materialsUnlockLength,
       });
     }
-
-    // Add crafted item input
-    const craftedItemTxData = await getTransactionByTxID(craftedItemTxId);
-    if (!craftedItemTxData || !craftedItemTxData.outputs || !craftedItemTxData.outputs[0]) {
-      throw new Error(`Could not find crafted item transaction: ${craftedItemTxId}`);
-    }
-    const craftedItemTransaction = Transaction.fromBEEF(craftedItemTxData.outputs[0].beef);
-    sourceTransactions.push(craftedItemTransaction);
-    inputs.push({
-      inputDescription: "Crafted item",
+    transferInputs.push({
+      inputDescription: 'Crafted item',
       outpoint: craftedItemOutpoint,
-      unlockingScriptLength,
+      unlockingScriptLength: craftedUnlockLength,
     });
 
-    // Note: Change token inputs are already included in transferredMaterials above
-    // We don't need to add them again since we're transferring the original tokens back
+    // Build outputs: crafted item (index 0) then change tokens (indices 1, 2, ...)
+    const transferOutputs: any[] = [];
 
-    // Build outputs array (transfer to user)
-    const outputs: any[] = [];
-
-    // Output 1: Crafted item to user
+    // Crafted item → user (unique nonce N3_item)
+    const itemNonce = generateNonce();
+    const itemKey = await deriveRecipientKey(serverWallet, userIdentityKey, itemNonce);
     const craftedAssetId = craftedItemOutpoint.replace('.', '_');
-    outputs.push({
-      outputDescription: "Crafted item to user",
-      lockingScript: ordinalP2PKH.lock(
-        userPublicKey,
-        craftedAssetId,
-        craftedItemMetadata,  // Item metadata (game data only)
-        'transfer',
-        1  // amt=1 for items
-      ).toHex(),
+    transferOutputs.push({
+      outputDescription: 'Crafted item to user',
+      lockingScript: ordinalP2PKH.lock(itemKey, craftedAssetId, craftedItemMetadata, 'transfer', 1).toHex(),
       satoshis: 1,
     });
 
-    // Outputs 2+: Material change tokens to user
-    for (const change of changeOutpoints) {
-      // Find the original transferred material to get its assetId
-      const originalMaterial = transferredMaterials.find(m => m.lootTableId === change.lootTableId);
-      if (!originalMaterial) {
-        throw new Error(`Could not find original material for ${change.lootTableId}`);
-      }
-
-      // Extract assetId from the original material's tokenId
-      // The tokenId is the outpoint from the previous transfer, which contains the assetId
-      const changeAssetId = change.outpoint.replace('.', '_');
-
-      outputs.push({
+    // Change tokens → user (unique nonce per change)
+    const changeNonces: string[] = [];
+    for (const change of materialChanges) {
+      const changeNonce = generateNonce();
+      changeNonces.push(changeNonce);
+      const changeKey = await deriveRecipientKey(serverWallet, userIdentityKey, changeNonce);
+      const originalMaterial = transferredMaterials.find(m => m.lootTableId === change.lootTableId)!;
+      const changeAssetId = originalMaterial.tokenId.replace('.', '_');
+      transferOutputs.push({
         outputDescription: `Material change: ${change.lootTableId}`,
         lockingScript: ordinalP2PKH.lock(
-          userPublicKey,
+          changeKey,
           changeAssetId,
           {
             name: 'material_token',
             lootTableId: change.lootTableId,
-            // Use original material metadata
-            itemName: originalMaterial.itemName,
-            description: originalMaterial.description,
-            icon: originalMaterial.icon,
-            rarity: originalMaterial.rarity,
-            tier: originalMaterial.tier,
+            itemName: change.itemName,
+            description: change.description,
+            icon: change.icon,
+            rarity: change.rarity,
+            tier: change.tier,
           },
           'transfer',
-          change.amount  // Updated amt field with reduced quantity
+          change.changeAmount,
         ).toHex(),
         satoshis: 1,
       });
     }
 
-    // Merge BEEFs for multiple inputs
+    // Merge BEEFs for all inputs
     const mergedBeef = new Beef();
-    for (const tx of sourceTransactions) {
-      mergedBeef.mergeBeef(tx.toBEEF());
-    }
+    mergedBeef.mergeBeef(batchTransferTransaction.toBEEF());
+    mergedBeef.mergeBeef(craftedItemTx.toBEEF());
     const inputBEEF = mergedBeef.toBinary();
 
-    // Create transfer transaction
     const transferActionRes = await serverWallet.createAction({
-      description: "Transferring crafted item and changes to user",
+      description: 'Transferring crafted item and material changes to user',
       inputBEEF,
-      inputs,
-      outputs,
-      options: {
-        randomizeOutputs: false,
-        acceptDelayedBroadcast: false,
-      },
+      inputs: transferInputs,
+      outputs: transferOutputs,
+      options: { randomizeOutputs: false, acceptDelayedBroadcast: false },
     });
 
     if (!transferActionRes.signableTransaction) {
       throw new Error('Failed to create signable transfer transaction');
     }
 
-    // Sign with createAction → signAction flow
     const reference = transferActionRes.signableTransaction.reference;
     const txToSign = Transaction.fromBEEF(transferActionRes.signableTransaction.tx);
 
-    // Add unlocking script templates for all inputs
-    for (let i = 0; i < txToSign.inputs.length; i++) {
-      txToSign.inputs[i].unlockingScriptTemplate = unlockTemplate;
-      txToSign.inputs[i].sourceTransaction = sourceTransactions[i];
+    // Apply unlock templates: materials use shared template, crafted item uses its own
+    const materialInputCount = transferredMaterials.length;
+    for (let i = 0; i < materialInputCount; i++) {
+      txToSign.inputs[i].unlockingScriptTemplate = materialsUnlockTemplate;
+      txToSign.inputs[i].sourceTransaction = batchTransferTransaction;
     }
+    txToSign.inputs[materialInputCount].unlockingScriptTemplate = craftedUnlockTemplate;
+    txToSign.inputs[materialInputCount].sourceTransaction = craftedItemTx;
 
     await txToSign.sign();
 
-    // Extract unlocking scripts
     const spends: Record<string, any> = {};
     for (let i = 0; i < txToSign.inputs.length; i++) {
       const unlockingScript = txToSign.inputs[i].unlockingScript;
-      if (!unlockingScript) {
-        throw new Error(`Missing unlocking script for input ${i}`);
-      }
+      if (!unlockingScript) throw new Error(`Missing unlocking script for input ${i}`);
       spends[String(i)] = { unlockingScript: unlockingScript.toHex() };
     }
 
-    const transferAction = await serverWallet.signAction({
-      reference,
-      spends,
-    });
+    const transferAction = await serverWallet.signAction({ reference, spends });
 
-    if (!transferAction.tx) {
-      throw new Error('Failed to sign transfer action');
-    }
+    if (!transferAction.tx) throw new Error('Failed to sign transfer action');
 
     const transferTx = Transaction.fromAtomicBEEF(transferAction.tx);
     const transferBroadcast = await broadcastTX(transferTx);
     const transferTxId = transferBroadcast.txid!;
 
-    console.log(`✅ [TRANSFER] Transferred crafted item + ${changeOutpoints.length} change tokens to user: ${transferTxId}`);
+    console.log(`✅ [TRANSFER] Transferred crafted item + ${materialChanges.length} change tokens: ${transferTxId}`);
 
-    // ========================================
-    // STEP 6: Update database
-    // ========================================
+    // 11. Update database
 
-    // Create NFTLoot document for crafted item
     const userCraftedTokenId = `${transferTxId}.0`;
+
+    // NFTLoot doc for crafted item (carries keyId/counterparty for wallet internalization)
     const nftLootDoc = {
       lootTableId: outputItem.lootTableId,
       name: outputItem.name,
@@ -539,33 +372,31 @@ export async function POST(request: NextRequest) {
       rarity: outputItem.rarity,
       type: outputItem.type,
       attributes: craftedItemMetadata,
-      mintOutpoint: craftedItemOutpoint,  // Proof of original mint: ${craftedItemTxId}.0
-      tokenId: userCraftedTokenId,         // Current location: ${transferTxId}.0
+      mintOutpoint: craftedItemOutpoint,
+      tokenId: userCraftedTokenId,
+      keyId: itemNonce,
+      counterparty: serverIdentityKey,
       createdAt: new Date(),
     };
 
     const nftResult = await nftLootCollection.insertOne(nftLootDoc);
     const nftLootId = nftResult.insertedId.toString();
 
-    // Calculate rolled stats if this is equipment
-    let rolledStats: Record<string, number> | undefined = undefined;
+    // Calculate rolled stats for equipment
+    let rolledStats: Record<string, number> | undefined;
     if (outputItem.crafted && outputItem.crafted.statRoll && outputItem.equipmentStats) {
       const statRoll = outputItem.crafted.statRoll;
       rolledStats = {};
-
       for (const [stat, value] of Object.entries(outputItem.equipmentStats)) {
         if (typeof value === 'number') {
-          // Preserve decimals for autoClickRate, round others
-          if (stat === 'autoClickRate') {
-            rolledStats[stat] = Math.round(value * statRoll * 100) / 100;
-          } else {
-            rolledStats[stat] = Math.round(value * statRoll);
-          }
+          rolledStats[stat] = stat === 'autoClickRate'
+            ? Math.round(value * statRoll * 100) / 100
+            : Math.round(value * statRoll);
         }
       }
     }
 
-    // Create UserInventory document for crafted item (minted=true since blockchain-only)
+    // UserInventory entry for crafted item
     const inventoryDoc: any = {
       userId,
       lootTableId: outputItem.lootTableId,
@@ -575,71 +406,54 @@ export async function POST(request: NextRequest) {
       nftLootId: nftResult.insertedId,
       mintOutpoint: craftedItemOutpoint,
       tokenId: userCraftedTokenId,
+      keyId: itemNonce,
+      counterparty: serverIdentityKey,
       acquiredAt: new Date(),
       crafted: true,
       statRoll: outputItem.crafted?.statRoll,
-      rolledStats: rolledStats,
+      rolledStats,
       updatedAt: new Date(),
     };
 
-    const inventoryResult = await userInventoryCollection.insertOne(inventoryDoc);
+    await userInventoryCollection.insertOne(inventoryDoc);
 
-    console.log(`✅ [DATABASE] Created crafted item in inventory with minted=true (statRoll: ${outputItem.crafted?.statRoll})`);
+    console.log(`✅ [DATABASE] Created crafted item in inventory (statRoll: ${outputItem.crafted?.statRoll})`);
 
     // Handle material token updates/deletions
-    const materialChangeTokens: Array<{
-      lootTableId: string;
-      tokenId: string;
-      quantity: number;
-    }> = [];
+    const lootTableIdsWithChange = new Set(materialChanges.map(c => c.lootTableId));
 
-    // First, collect all lootTableIds that have change
-    const lootTableIdsWithChange = new Set(changeOutpoints.map(c => c.lootTableId));
-
-    // Delete fully consumed material tokens (no change)
-    const fullyConsumedMaterials = transferredMaterials.filter(
-      m => !lootTableIdsWithChange.has(m.lootTableId)
-    );
-
+    // Delete fully consumed material tokens
+    const fullyConsumedMaterials = transferredMaterials.filter(m => !lootTableIdsWithChange.has(m.lootTableId));
     for (const material of fullyConsumedMaterials) {
-      await materialTokensCollection.deleteOne({
-        userId,
-        lootTableId: material.lootTableId,
-      });
-      console.log(`🗑️ [DATABASE] Deleted fully consumed material token: ${material.lootTableId}`);
+      await materialTokensCollection.deleteOne({ userId, lootTableId: material.lootTableId });
     }
 
-    // Update material tokens with change
-    for (let i = 0; i < changeOutpoints.length; i++) {
-      const change = changeOutpoints[i];
-      const changeTokenId = `${transferTxId}.${i + 1}`;  // Output indices: 0=crafted item, 1+=changes
+    // Update change tokens with new outpoint + keyId/counterparty
+    const materialChangeTokens: Array<{ lootTableId: string; tokenId: string; quantity: number }> = [];
 
-      materialChangeTokens.push({
-        lootTableId: change.lootTableId,
-        tokenId: changeTokenId,
-        quantity: change.amount,
-      });
+    for (let i = 0; i < materialChanges.length; i++) {
+      const change = materialChanges[i];
+      const changeTokenId = `${transferTxId}.${i + 1}`;  // output 0 = crafted item
+      const changeNonce = changeNonces[i];
+      const originalMaterial = transferredMaterials.find(m => m.lootTableId === change.lootTableId)!;
 
-      // Find original material to get full metadata
-      const originalMaterial = transferredMaterials.find(m => m.lootTableId === change.lootTableId);
-      if (!originalMaterial) {
-        throw new Error(`Could not find original material for ${change.lootTableId}`);
-      }
+      materialChangeTokens.push({ lootTableId: change.lootTableId, tokenId: changeTokenId, quantity: change.changeAmount });
 
-      // Update existing MaterialToken document with new change token
       await materialTokensCollection.updateOne(
         { userId, lootTableId: change.lootTableId },
         {
           $set: {
             tokenId: changeTokenId,
-            quantity: change.amount,
+            quantity: change.changeAmount,
+            keyId: changeNonce,
+            counterparty: serverIdentityKey,
             updatedAt: new Date(),
           },
           $push: {
             updateHistory: {
               operation: 'subtract',
               previousQuantity: originalMaterial.quantity,
-              newQuantity: change.amount,
+              newQuantity: change.changeAmount,
               transactionId: transferTxId,
               reason: `Consumed in crafting recipe: ${recipeId}`,
               timestamp: new Date(),
@@ -647,18 +461,31 @@ export async function POST(request: NextRequest) {
           },
         }
       );
-
-      console.log(`🔄 [DATABASE] Updated material token with change: ${change.lootTableId} (${originalMaterial.quantity} → ${change.amount})`);
     }
 
     console.log('✅ [DATABASE] Updated all database documents');
 
+    // Build received[] aligned to transfer tx output indices
+    const received: Array<{ outputIndex: number; keyId: string; counterparty: string; tags: string[] }> = [
+      { outputIndex: 0, keyId: itemNonce, counterparty: serverIdentityKey, tags: ['type:item'] },
+    ];
+    for (let i = 0; i < materialChanges.length; i++) {
+      received.push({
+        outputIndex: i + 1,
+        keyId: changeNonces[i],
+        counterparty: serverIdentityKey,
+        tags: ['type:material'],
+      });
+    }
+
     return NextResponse.json({
       success: true,
       nftId: nftLootId,
-      tokenId: userCraftedTokenId,       // Full outpoint: ${transferTxId}.0
+      tokenId: userCraftedTokenId,
       transferTransactionId: transferTxId,
-      materialChangeTokens,              // Array of {lootTableId, tokenId, quantity}
+      materialChangeTokens,
+      transferBeef: encodeBeef(Array.from(transferAction.tx!)),
+      received,
     });
 
   } catch (error) {
