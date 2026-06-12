@@ -47,6 +47,7 @@ export async function POST(request: NextRequest) {
       walletParams,
       reason,
       acquiredFrom,
+      inventoryItemIds,    // unminted UserInventory items being merged in (to consume)
     } = body;
 
     // Validate required fields
@@ -71,7 +72,7 @@ export async function POST(request: NextRequest) {
     }
 
     // 3. Connect to MongoDB
-    const { materialTokensCollection } = await connectToMongo();
+    const { materialTokensCollection, userInventoryCollection } = await connectToMongo();
 
     // 4. Verify user owns the material token
     const existingToken = await materialTokensCollection.findOne({
@@ -359,6 +360,14 @@ export async function POST(request: NextRequest) {
         },
       }
     );
+
+    // Consume the unminted UserInventory items that fed the added quantity.
+    if (Array.isArray(inventoryItemIds) && inventoryItemIds.length > 0) {
+      const { ObjectId } = await import('mongodb');
+      const objectIds = inventoryItemIds.map((id: string) => new ObjectId(id));
+      const deleteResult = await userInventoryCollection.deleteMany({ _id: { $in: objectIds }, userId });
+      console.log(`✅ [CONSUME] Removed ${deleteResult.deletedCount} UserInventory items after merging ${itemName}`);
+    }
 
     console.log('✅ [DATABASE] Updated material token document');
 

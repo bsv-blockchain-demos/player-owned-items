@@ -3,6 +3,7 @@ import { WalletClient, Transaction } from '@bsv/sdk';
 import { OrdinalsP2PKH } from '@/utils/ordinalP2PKH';
 import { createWalletPayment } from '@/utils/createWalletPayment';
 import { getTransactionByTxID, broadcastTX } from './useOverlayFunctions';
+import { fetchTokenSourceTx } from '@/utils/fetchTokenSourceTx';
 import { encodeBeef, decodeBeef } from '@/utils/beefEncoding';
 import { internalizeToBasket } from '@/utils/internalizeToBasket';
 import { TOKEN_PROTOCOL, generateNonce, deriveRecipientKey } from '@/utils/tokenDerivation';
@@ -175,16 +176,8 @@ export function useUpdateMaterialToken() {
         if (update.operation === 'add') {
           console.log(`[ADD] Transferring ${update.lootTableId} to server for merge`);
 
-          // Get previous token transaction from overlay
-          const previousTxid = update.currentTokenId.split('.')[0];
-          const oldTx = await getTransactionByTxID(previousTxid);
-
-          if (!oldTx || !oldTx.outputs || !oldTx.outputs[0]) {
-            throw new Error(`Could not find previous transaction: ${previousTxid}`);
-          }
-
-          // Parse transaction from BEEF
-          const previousTransaction = Transaction.fromBEEF(oldTx.outputs[0].beef);
+          // Resolve the existing token's source tx (overlay → wallet-basket fallback)
+          const previousTransaction = await fetchTokenSourceTx(wallet, update.currentTokenId);
 
           const ordinalP2PKH = new OrdinalsP2PKH();
 
@@ -219,7 +212,7 @@ export function useUpdateMaterialToken() {
           // Step 1: Create action
           const transferActionRes = await wallet.createAction({
             description: `Transferring ${update.itemName} to server for merge`,
-            inputBEEF: oldTx.outputs[0].beef,
+            inputBEEF: previousTransaction.toBEEF(),
             inputs: [{
               inputDescription: `Material token: ${update.itemName}`,
               outpoint: update.currentTokenId,
@@ -301,6 +294,7 @@ export function useUpdateMaterialToken() {
               walletParams,
               reason: update.reason,
               acquiredFrom: update.acquiredFrom,
+              inventoryItemIds: update.inventoryItemIds || [], // consumed server-side in the merge
             }),
           });
 
@@ -513,31 +507,36 @@ export function useUpdateMaterialToken() {
         }
       }
 
-      // Call backend API to save material token updates
-      const apiResult = await fetch('/api/materials/update-tokens', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          updates: results.map((result, index) => ({
-            lootTableId: updates[index].lootTableId,
-            itemName: updates[index].itemName,
-            previousTokenId: result.previousTokenId,
-            newTokenId: result.newTokenId,
-            transactionId: result.transactionId,
-            previousQuantity: result.previousQuantity,
-            newQuantity: result.newQuantity,
-            operation: result.operation,
-            inventoryItemIds: updates[index].inventoryItemIds || [],  // IDs to consume
-            reason: updates[index].reason,
-          })),
-        }),
-      });
+      // 'add' is fully persisted server-side by add-and-merge (token doc + consume),
+      // so only subtract/set/burn results need the update-tokens DB save.
+      const dbUpdates = results
+        .map((result, index) => ({ result, src: updates[index] }))
+        .filter(({ result }) => result.operation !== 'add');
 
-      if (!apiResult.ok) {
-        const errorData = await apiResult.json();
-        throw new Error(errorData.error || 'Failed to save material token updates to database');
+      if (dbUpdates.length > 0) {
+        const apiResult = await fetch('/api/materials/update-tokens', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            updates: dbUpdates.map(({ result, src }) => ({
+              lootTableId: src.lootTableId,
+              itemName: src.itemName,
+              previousTokenId: result.previousTokenId,
+              newTokenId: result.newTokenId,
+              transactionId: result.transactionId,
+              previousQuantity: result.previousQuantity,
+              newQuantity: result.newQuantity,
+              operation: result.operation,
+              inventoryItemIds: src.inventoryItemIds || [],
+              reason: src.reason,
+            })),
+          }),
+        });
+
+        if (!apiResult.ok) {
+          const errorData = await apiResult.json();
+          throw new Error(errorData.error || 'Failed to save material token updates to database');
+        }
       }
 
       console.log(`Material tokens updated: ${results.length} updates`);
