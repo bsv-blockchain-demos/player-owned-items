@@ -292,7 +292,7 @@ export async function POST(request: NextRequest) {
 
       const tokenId = `${mintTxId}.0`; // mint proof and current location are the same outpoint
 
-      console.log(`✅ [MINT-MATERIAL] Minted ${itemName} directly to user:`, { mintTxId, tokenId, nonce });
+      console.log('✅ [MINT-MATERIAL] Minted %s directly to user:', itemName, { mintTxId, tokenId, nonce });
 
       // Store for top-level response (one material = one tx = one output)
       finalMintActionTx = mintAction.tx;
