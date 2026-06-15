@@ -209,7 +209,7 @@ export async function POST(request: NextRequest) {
       const userKey = await deriveRecipientKey(serverWallet, userIdentityKey, nonce);
       const mintLockingScript = ordinalP2PKH.lock(userKey, '', materialMetadata, 'deploy+mint', quantity);
 
-      console.log(`🔨 [MINT-MATERIAL] Creating deploy+mint locked to user for ${itemName}:`, {
+      console.log('🔨 [MINT-MATERIAL] Creating deploy+mint locked to user for %s:', itemName, {
         operation: 'deploy+mint',
         userKey,
         quantity,
