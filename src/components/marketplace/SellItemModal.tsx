@@ -56,8 +56,8 @@ export default function SellItemModal({ wallet, onClose, onSuccess }: SellItemMo
   const loadSellableItems = async () => {
     try {
       setLoading(true);
-      // Only fetch minted items (backend filtering)
-      const response = await fetch('/api/inventory/get?mintedOnly=true');
+      // Only fetch minted items, excluding any already on the marketplace (backend filtering)
+      const response = await fetch('/api/inventory/get?mintedOnly=true&excludeListed=true');
       const data = await response.json();
 
       if (response.ok && data.success) {
