@@ -225,6 +225,18 @@ async function connectToMongo() {
           marketplaceItemsCollection.createIndex({ tier: 1, status: 1 }), // Filter by tier
           marketplaceItemsCollection.createIndex({ itemName: 1 }), // Regular index for name search
 
+          // At most one active listing per item (partial: only indexes active listings)
+          safeCreateIndex(
+            marketplaceItemsCollection,
+            { inventoryItemId: 1 },
+            { unique: true, partialFilterExpression: { status: 'active', inventoryItemId: { $exists: true } } }
+          ),
+          safeCreateIndex(
+            marketplaceItemsCollection,
+            { materialTokenId: 1 },
+            { unique: true, partialFilterExpression: { status: 'active', materialTokenId: { $exists: true } } }
+          ),
+
           // Marketplace listing BEEF backups, keyed by listingId
           safeCreateIndex(marketplaceListingBeefsCollection, { listingId: 1 }, { unique: true }),
         ]);

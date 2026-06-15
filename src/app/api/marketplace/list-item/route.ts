@@ -302,7 +302,16 @@ export async function POST(request: NextRequest) {
       listedAt: new Date(),
     };
 
-    const result = await marketplaceItemsCollection.insertOne(marketplaceItem);
+    let result;
+    try {
+      result = await marketplaceItemsCollection.insertOne(marketplaceItem);
+    } catch (e: any) {
+      // Partial unique index rejected a concurrent duplicate active listing
+      if (e?.code === 11000) {
+        return NextResponse.json({ error: 'Item is already listed on marketplace' }, { status: 400 });
+      }
+      throw e;
+    }
 
     // Back up the listing tx BEEF for overlay-independent spends.
     await marketplaceListingBeefsCollection.insertOne({
