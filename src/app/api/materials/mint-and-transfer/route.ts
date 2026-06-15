@@ -258,7 +258,7 @@ export async function POST(request: NextRequest) {
         throw new Error(`Missing unlocking script after signing for ${itemName}`);
       }
 
-      console.log(`🔓 [MINT-MATERIAL] Transaction signed for ${itemName}:`, {
+      console.log('🔓 [MINT-MATERIAL] Transaction signed for %s:', itemName, {
         scriptLength: mintUnlockingScript.toHex().length,
       });
 
