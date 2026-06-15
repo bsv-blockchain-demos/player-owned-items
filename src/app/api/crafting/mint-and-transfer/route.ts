@@ -333,12 +333,21 @@ export async function POST(request: NextRequest) {
 
     // Apply unlock templates: materials use shared template, crafted item uses its own
     const materialInputCount = transferredMaterials.length;
+    if (!Number.isSafeInteger(materialInputCount) || materialInputCount < 0) {
+      throw new Error('Invalid material input count');
+    }
+    if (materialInputCount >= txToSign.inputs.length) {
+      throw new Error('Crafted input index out of range');
+    }
+
     for (let i = 0; i < materialInputCount; i++) {
       txToSign.inputs[i].unlockingScriptTemplate = materialsUnlockTemplate;
       txToSign.inputs[i].sourceTransaction = batchTransferTransaction;
     }
-    txToSign.inputs[materialInputCount].unlockingScriptTemplate = craftedUnlockTemplate;
-    txToSign.inputs[materialInputCount].sourceTransaction = craftedItemTx;
+
+    const craftedInputIndex = materialInputCount;
+    txToSign.inputs[craftedInputIndex].unlockingScriptTemplate = craftedUnlockTemplate;
+    txToSign.inputs[craftedInputIndex].sourceTransaction = craftedItemTx;
 
     await txToSign.sign();
 
