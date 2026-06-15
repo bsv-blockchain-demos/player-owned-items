@@ -6,7 +6,10 @@ import { WalletOrdLock } from '@bsv/wallet-helper';
 import { OrdinalsP2PKH } from '@/utils/ordinalP2PKH';
 import { usePlayer } from '@/contexts/PlayerContext';
 import toast from 'react-hot-toast';
-import { broadcastTX, getTransactionByTxID } from '@/utils/overlayFunctions';
+import { broadcastTX } from '@/utils/overlayFunctions';
+import { fetchTokenSourceTx } from '@/utils/fetchTokenSourceTx';
+import { TOKEN_PROTOCOL } from '@/utils/tokenDerivation';
+import { encodeBeef } from '@/utils/beefEncoding';
 
 interface SellItemModalProps {
   wallet: WalletClient | null;
@@ -34,6 +37,8 @@ interface SellableItem {
   isEmpowered?: boolean;
   prefix?: any;
   suffix?: any;
+  keyId?: string;       // derivation nonce used to lock this token (absent = legacy)
+  counterparty?: string; // counterparty identity key (absent = legacy)
 }
 
 export default function SellItemModal({ wallet, onClose, onSuccess }: SellItemModalProps) {
@@ -110,6 +115,8 @@ export default function SellItemModal({ wallet, onClose, onSuccess }: SellItemMo
             isEmpowered: item.isEmpowered,
             prefix: item.prefix,
             suffix: item.suffix,
+            keyId: item.keyId,
+            counterparty: item.counterparty,
           }));
 
         setItems(sellable);
@@ -170,13 +177,9 @@ export default function SellItemModal({ wallet, onClose, onSuccess }: SellItemMo
         throw new Error('Invalid tokenId format');
       }
 
-      const tokenTxData = await getTransactionByTxID(tokenTxId);
-      if (!tokenTxData?.outputs?.[tokenVout]?.beef) {
-        throw new Error(`Could not find token transaction: ${tokenTxId}`);
-      }
-
-      const tokenBeef = tokenTxData.outputs[tokenVout].beef;
-      const tokenTransaction = Transaction.fromBEEF(tokenBeef);
+      // Resolve token source tx: overlay → wallet-basket fallback
+      const tokenTransaction = await fetchTokenSourceTx(wallet, selectedItem.tokenId);
+      const tokenBeef = tokenTransaction.toBEEF();
 
       const payAddress = PublicKey.fromString(userPublicKey).toAddress();
       const cancelAddress = payAddress;
@@ -223,7 +226,13 @@ export default function SellItemModal({ wallet, onClose, onSuccess }: SellItemMo
       });
 
       const ordinalP2PKH = new OrdinalsP2PKH();
-      const tokenUnlockTemplate = ordinalP2PKH.unlock(wallet, 'single', true);
+      // Pass derivation so derived-key tokens unlock correctly (legacy tokens: undefined = no derivation)
+      const tokenUnlockTemplate = ordinalP2PKH.unlock(
+        wallet, 'single', true, undefined, undefined,
+        selectedItem.keyId
+          ? { protocolID: TOKEN_PROTOCOL, keyID: selectedItem.keyId, counterparty: selectedItem.counterparty! }
+          : undefined,
+      );
       const tokenUnlockingLength = await tokenUnlockTemplate.estimateLength();
 
       const actionRes = await wallet.createAction({
@@ -301,6 +310,7 @@ export default function SellItemModal({ wallet, onClose, onSuccess }: SellItemMo
           userPublicKey,
           ordLockOutpoint,
           ordLockScript: ordLockScript.toHex(),
+          ordLockBeef: encodeBeef(Array.from(action.tx!)), // server validates from this (no overlay race)
         }),
       });
 

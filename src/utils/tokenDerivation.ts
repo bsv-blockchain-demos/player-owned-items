@@ -43,3 +43,21 @@ export async function deriveSelfKey(
   });
   return publicKey;
 }
+
+/**
+ * Lock a token to YOURSELF so it later unlocks with `counterparty` — matches how
+ * received tokens are keyed (e.g. a seller reclaiming their own listing on cancel).
+ */
+export async function deriveOwnKey(
+  wallet: WalletInterface,
+  counterpartyIdentityKey: string,
+  nonce: string,
+): Promise<string> {
+  const { publicKey } = await wallet.getPublicKey({
+    protocolID: TOKEN_PROTOCOL,
+    keyID: nonce,
+    counterparty: counterpartyIdentityKey,
+    forSelf: true,
+  });
+  return publicKey;
+}

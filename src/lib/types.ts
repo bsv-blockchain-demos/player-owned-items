@@ -492,3 +492,16 @@ export interface MarketplaceItem {
   prefix?: any;               // Prefix inscription
   suffix?: any;               // Suffix inscription
 }
+
+/**
+ * Base64 BEEF backup of a listing's orderLock tx, in its own collection so the
+ * marketplace_items docs stay small/fast for browse queries. Lets purchase/cancel
+ * spend the orderLock UTXO without depending on the overlay. Removed on sold/cancelled.
+ */
+export interface MarketplaceListingBeef {
+  _id?: ObjectId;
+  listingId: string;       // Reference to MarketplaceItem._id (string)
+  ordLockOutpoint: string; // The listing's orderLock outpoint (txid.vout)
+  beef: string;            // base64 BEEF of the listing tx
+  createdAt: Date;
+}

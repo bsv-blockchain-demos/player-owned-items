@@ -7,6 +7,9 @@ import toast from 'react-hot-toast';
 import { WalletOrdLock } from '@bsv/wallet-helper';
 import { OrdinalsP2PKH } from '@/utils/ordinalP2PKH';
 import { broadcastTX, getTransactionByTxID } from '@/utils/overlayFunctions';
+import { generateNonce, deriveOwnKey } from '@/utils/tokenDerivation';
+import { encodeBeef, decodeBeef } from '@/utils/beefEncoding';
+import { internalizeToBasket } from '@/utils/internalizeToBasket';
 
 interface MarketplaceItemDetailsModalProps {
   item: {
@@ -104,18 +107,19 @@ export default function MarketplaceItemDetailsModal({
         throw new Error('Listing missing OrdLock data');
       }
 
-      const [ordLockTxId, ordLockVoutStr] = String(listing.ordLockOutpoint).split('.');
-      const ordLockVout = parseInt(ordLockVoutStr, 10);
-      if (!ordLockTxId || Number.isNaN(ordLockVout)) {
-        throw new Error('Invalid ordLockOutpoint format');
+      // Resolve the listing tx: DB backup first, overlay as fallback.
+      let ordLockBeef: number[];
+      if (listing.ordLockBeef) {
+        ordLockBeef = decodeBeef(listing.ordLockBeef);
+      } else {
+        const [ordLockTxId, ordLockVoutStr] = String(listing.ordLockOutpoint).split('.');
+        const ordLockTxData = await getTransactionByTxID(ordLockTxId);
+        const overlayBeef = ordLockTxData?.outputs?.[parseInt(ordLockVoutStr, 10)]?.beef;
+        if (!overlayBeef) {
+          throw new Error('Listing tx not found in DB backup or overlay');
+        }
+        ordLockBeef = overlayBeef;
       }
-
-      const ordLockTxData = await getTransactionByTxID(ordLockTxId);
-      if (!ordLockTxData?.outputs?.[ordLockVout]?.beef) {
-        throw new Error(`Could not find OrdLock transaction: ${ordLockTxId}`);
-      }
-
-      const ordLockBeef = ordLockTxData.outputs[ordLockVout].beef;
       const ordLockTransaction = Transaction.fromBEEF(ordLockBeef);
 
       const ordLock = new WalletOrdLock(wallet);
@@ -132,6 +136,12 @@ export default function MarketplaceItemDetailsModal({
       const cancelUnlockingLength = await cancelUnlockTemplate.estimateLength();
 
       const ordinalP2PKH = new OrdinalsP2PKH();
+
+      // Derive a self-key so the reclaimed token is keyed like any received token
+      const serverIdentityKeyRes = await fetch('/api/server-identity-key');
+      const { publicKey: serverIdentityKey } = await serverIdentityKeyRes.json();
+      const cancelNonce = generateNonce();
+      const returnKey = await deriveOwnKey(wallet, serverIdentityKey, cancelNonce);
 
       const returnItemData: Record<string, any> = listing.materialTokenId
         ? {
@@ -164,7 +174,7 @@ export default function MarketplaceItemDetailsModal({
         };
 
       const returnLockingScript = ordinalP2PKH.lock(
-        publicKey,
+        returnKey,
         listing.assetId,
         returnItemData,
         'transfer'
@@ -237,6 +247,23 @@ export default function MarketplaceItemDetailsModal({
 
       const returnTokenId = `${cancelTxId}.${returnVout}`;
 
+      // Internalize the reclaimed token non-fatally (recoverable via reindexFromBasket)
+      try {
+        await internalizeToBasket(
+          wallet,
+          Array.from(signed.tx!),
+          [{
+            outputIndex: returnVout,
+            keyId: cancelNonce,
+            counterparty: serverIdentityKey,
+            tags: [listing.materialTokenId ? 'type:material' : 'type:item'],
+          }],
+          `Reclaim ${listing.itemName}`,
+        );
+      } catch (e) {
+        console.warn('Listing cancelled on-chain but wallet internalize failed (recoverable via reindexFromBasket):', e);
+      }
+
       const response = await fetch('/api/marketplace/cancel-listing', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -244,6 +271,9 @@ export default function MarketplaceItemDetailsModal({
           listingId: item._id,
           userPublicKey: publicKey,
           returnTokenId,
+          cancelBeef: encodeBeef(Array.from(signed.tx!)), // server validates from this (no overlay race)
+          keyId: cancelNonce,
+          counterparty: serverIdentityKey,
         }),
       });
 
@@ -279,45 +309,32 @@ export default function MarketplaceItemDetailsModal({
         throw new Error('Wallet not authenticated');
       }
 
-      // Get user's public key
-      const { publicKey: buyerPublicKey } = await wallet.getPublicKey({
-        protocolID: [0, "monsterbattle"],
-        keyID: "0",
-      });
+      // Identity key is the derivation counterparty the server locks toward
+      const { publicKey: buyerIdentityKey } = await wallet.getPublicKey({ identityKey: true });
 
-      // Fetch server identity key
+      // Fetch server identity key for payment counterparty
       const serverPubKeyResponse = await fetch('/api/server-identity-key');
       if (!serverPubKeyResponse.ok) {
         throw new Error('Failed to fetch server identity key');
       }
       const { publicKey: serverIdentityKey } = await serverPubKeyResponse.json();
 
-      console.log('Creating payment transaction for purchase...');
+      const totalPayment = item.price + 100; // price + network fees
 
-      // Calculate total payment (item price + network fees)
-      const totalPayment = item.price + 100; // Add 100 sats for network fees
-
-      // Create WalletP2PKH payment with derivation params
-      const { paymentTx, paymentTxId, walletParams } = await createWalletPayment(
+      const { paymentTx, walletParams } = await createWalletPayment(
         wallet,
         serverIdentityKey,
         totalPayment,
         `Payment for marketplace purchase: ${item.itemName}`
       );
 
-      console.log('Payment transaction created:', {
-        txid: paymentTxId,
-        satoshis: totalPayment,
-        walletParams,
-      });
-
       const response = await fetch('/api/marketplace/purchase-listing', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           listingId: item._id,
-          buyerPublicKey,
-          paymentTx,
+          buyerIdentityKey,
+          paymentTx: encodeBeef(paymentTx), // base64 BEEF
           walletParams,
         }),
       });
@@ -326,6 +343,15 @@ export default function MarketplaceItemDetailsModal({
 
       if (!response.ok) {
         throw new Error(data.error || 'Failed to purchase item');
+      }
+
+      // Internalize the bought token non-fatally (recoverable via reindexFromBasket)
+      if (typeof data.transferBeef === 'string' && data.received) {
+        try {
+          await internalizeToBasket(wallet, decodeBeef(data.transferBeef), [data.received], `Bought ${item.itemName ?? 'item'}`);
+        } catch (e) {
+          console.warn('Item bought server-side but wallet internalize failed (recoverable via reindexFromBasket):', e);
+        }
       }
 
       toast.success(data.message, { id: loadingToast });

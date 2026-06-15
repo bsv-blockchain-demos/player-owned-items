@@ -10,6 +10,7 @@ import {
 import { OrdinalsP2PKH } from '../src/utils/ordinalP2PKH';
 import { WalletOrdLock as OrdLock } from '@bsv/wallet-helper';
 import { makeWallet } from './helpers/mockWallet';
+import { TOKEN_PROTOCOL, generateNonce, deriveRecipientKey, deriveOwnKey } from '../src/utils/tokenDerivation';
 
 describe('OrdLock - Marketplace Transaction Validation', () => {
   const storageURL = 'https://store-us-1.bsvb.tech';
@@ -1180,5 +1181,105 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
       expect(finalAscii).toContain(assetId);
       expect(finalAscii).toContain('purchasedFrom');
     }, 60000); // Longer timeout for full flow
+  });
+
+  describe('Derived-key marketplace flow (post-migration)', () => {
+    it('lists, cancels, relists, and purchases a derived-key NFT (scripts valid)', async () => {
+      // Server derives recipient keys; seller + buyer have their own wallets.
+      const serverWallet = await makeWallet('main', storageURL, new PrivateKey(200).toHex());
+      const sellerWallet = await makeWallet('main', storageURL, new PrivateKey(201).toHex());
+      const buyerPriv = new PrivateKey(202);
+      const buyerWallet = await makeWallet('main', storageURL, buyerPriv.toHex());
+
+      const { publicKey: serverIdentityKey } = await serverWallet.getPublicKey({ identityKey: true });
+      const { publicKey: sellerIdentityKey } = await sellerWallet.getPublicKey({ identityKey: true });
+      const { publicKey: buyerIdentityKey } = await buyerWallet.getPublicKey({ identityKey: true });
+
+      const assetId = 'derived_flow_txid_0';
+      const itemData = { name: 'Derived Blade', type: 'weapon', rarity: 'legendary' };
+      // Order-lock pay/cancel addresses stay on the legacy key (untouched by the migration);
+      // cancelUnlock signs with [0,'monsterbattle']/'0'/self, so the address must match it.
+      const { publicKey: sellerLegacyKey } = await sellerWallet.getPublicKey({ protocolID: [0, 'monsterbattle'], keyID: '0', counterparty: 'self' });
+      const sellerAddress = PublicKey.fromString(sellerLegacyKey).toAddress();
+
+      // Mint NFT to the seller's recipient-derived key (server is the sender).
+      const mintNonce = generateNonce();
+      const sellerNftKey = await deriveRecipientKey(serverWallet, sellerIdentityKey, mintNonce);
+      const nftTx = new Transaction();
+      nftTx.addInput({ sourceTXID: '00'.repeat(32), sourceOutputIndex: 0, unlockingScript: Script.fromASM('OP_TRUE') });
+      nftTx.addOutput({ lockingScript: new OrdinalsP2PKH().lock(sellerNftKey, assetId, itemData, 'transfer'), satoshis: 1 });
+      nftTx.merklePath = MerklePath.fromCoinbaseTxidAndHeight(nftTx.id('hex'), 9000);
+
+      // List: seller unlocks the derived NFT ('single', true) into an orderLock.
+      const orderLock = new OrdLock(sellerWallet);
+      const listScript = await orderLock.lock({ ordAddress: sellerAddress, payAddress: sellerAddress, price: 4000, assetId, itemData, metadata: { app: 'monsterbattle', type: 'ord' } });
+      const listTx = new Transaction();
+      listTx.addInput({
+        sourceTransaction: nftTx,
+        sourceOutputIndex: 0,
+        unlockingScriptTemplate: new OrdinalsP2PKH().unlock(sellerWallet, 'single', true, undefined, undefined, { protocolID: TOKEN_PROTOCOL, keyID: mintNonce, counterparty: serverIdentityKey }),
+      });
+      listTx.addOutput({ lockingScript: listScript, satoshis: 1 });
+      await listTx.fee();
+      await listTx.sign();
+      expect(await listTx.verify('scripts only')).toBe(true);
+      listTx.merklePath = MerklePath.fromCoinbaseTxidAndHeight(listTx.id('hex'), 9001);
+
+      // Cancel: return the token to a self-derived key (deriveOwnKey toward the server).
+      const cancelNonce = generateNonce();
+      const reclaimKey = await deriveOwnKey(sellerWallet, serverIdentityKey, cancelNonce);
+      const cancelTx = new Transaction();
+      cancelTx.addInput({
+        sourceTransaction: listTx,
+        sourceOutputIndex: 0,
+        unlockingScriptTemplate: orderLock.cancelUnlock({ protocolID: [0, 'monsterbattle'], keyID: '0', counterparty: 'self' }),
+      });
+      cancelTx.addOutput({ lockingScript: new OrdinalsP2PKH().lock(reclaimKey, assetId, itemData, 'transfer'), satoshis: 1 });
+      await cancelTx.fee();
+      await cancelTx.sign();
+      expect(await cancelTx.verify('scripts only')).toBe(true);
+      cancelTx.merklePath = MerklePath.fromCoinbaseTxidAndHeight(cancelTx.id('hex'), 9002);
+
+      // Relist: seller unlocks the reclaimed derived token (counterparty = server, cancelNonce).
+      const relistScript = await orderLock.lock({ ordAddress: sellerAddress, payAddress: sellerAddress, price: 3000, assetId, itemData, metadata: { app: 'monsterbattle', type: 'ord' } });
+      const relistTx = new Transaction();
+      relistTx.addInput({
+        sourceTransaction: cancelTx,
+        sourceOutputIndex: 0,
+        unlockingScriptTemplate: new OrdinalsP2PKH().unlock(sellerWallet, 'single', true, undefined, undefined, { protocolID: TOKEN_PROTOCOL, keyID: cancelNonce, counterparty: serverIdentityKey }),
+      });
+      relistTx.addOutput({ lockingScript: relistScript, satoshis: 1 });
+      await relistTx.fee();
+      await relistTx.sign();
+      expect(await relistTx.verify('scripts only')).toBe(true);
+      relistTx.merklePath = MerklePath.fromCoinbaseTxidAndHeight(relistTx.id('hex'), 9003);
+
+      // Purchase: orderLock purchaseUnlock; output 0 = token to the BUYER's derived key.
+      const buyerPkh = Utils.fromBase58Check(buyerPriv.toPublicKey().toAddress()).data as number[];
+      const fundingTx = new Transaction();
+      fundingTx.addInput({ sourceTXID: '11'.repeat(32), sourceOutputIndex: 0, unlockingScript: Script.fromASM('OP_TRUE') });
+      fundingTx.addOutput({ lockingScript: new P2PKH().lock(buyerPkh), satoshis: 4000 });
+      fundingTx.merklePath = MerklePath.fromCoinbaseTxidAndHeight(fundingTx.id('hex'), 9004);
+
+      const purchaseNonce = generateNonce();
+      const buyerTokenKey = await deriveRecipientKey(serverWallet, buyerIdentityKey, purchaseNonce);
+      const purchaseTx = new Transaction();
+      purchaseTx.addInput({
+        sourceTransaction: relistTx,
+        sourceOutputIndex: 0,
+        unlockingScriptTemplate: orderLock.purchaseUnlock({ sourceSatoshis: 1, lockingScript: relistTx.outputs[0].lockingScript }),
+      });
+      purchaseTx.addInput({
+        sourceTransaction: fundingTx,
+        sourceOutputIndex: 0,
+        unlockingScriptTemplate: new P2PKH().unlock(buyerPriv, 'all', true, fundingTx.outputs[0].satoshis, fundingTx.outputs[0].lockingScript),
+      });
+      // Output 0: token to buyer's derived key (same P2PKH byte length as legacy)
+      purchaseTx.addOutput({ lockingScript: new OrdinalsP2PKH().lock(buyerTokenKey, assetId, itemData, 'transfer'), satoshis: 1 });
+      // Output 1: payment to seller (must match the orderLock payout)
+      purchaseTx.addOutput({ lockingScript: new P2PKH().lock(Utils.fromBase58Check(sellerAddress).data as number[]), satoshis: 3000 });
+      await purchaseTx.sign();
+      expect(await purchaseTx.verify('scripts only')).toBe(true);
+    }, 60000);
   });
 });

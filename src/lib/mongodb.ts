@@ -1,5 +1,5 @@
 import { MongoClient, ServerApiVersion, Db, Collection, Document } from 'mongodb';
-import type { User, NFTLoot, UserInventory, BattleSession, PlayerStats, MaterialToken, MarketplaceItem, BattleHistory } from './types';
+import type { User, NFTLoot, UserInventory, BattleSession, PlayerStats, MaterialToken, MarketplaceItem, MarketplaceListingBeef, BattleHistory } from './types';
 
 // Extract database name from URI
 function getDatabaseNameFromUri(connectionUri: string): string {
@@ -58,6 +58,7 @@ export const COLLECTIONS = {
   PLAYER_STATS: 'player_stats',
   MATERIAL_TOKENS: 'material_tokens',
   MARKETPLACE_ITEMS: 'marketplace_items',
+  MARKETPLACE_LISTING_BEEFS: 'marketplace_listing_beefs',
 } as const;
 
 // Database and collections cache
@@ -70,6 +71,7 @@ let battleHistoryCollection: Collection<BattleHistory> | null = null;
 let playerStatsCollection: Collection<PlayerStats> | null = null;
 let materialTokensCollection: Collection<MaterialToken> | null = null;
 let marketplaceItemsCollection: Collection<MarketplaceItem> | null = null;
+let marketplaceListingBeefsCollection: Collection<MarketplaceListingBeef> | null = null;
 let collectionsInitialized = false;
 
 // Promise to handle concurrent connection attempts
@@ -91,7 +93,8 @@ async function connectToMongo() {
       battleHistoryCollection: battleHistoryCollection!,
       playerStatsCollection: playerStatsCollection!,
       materialTokensCollection: materialTokensCollection!,
-      marketplaceItemsCollection: marketplaceItemsCollection!
+      marketplaceItemsCollection: marketplaceItemsCollection!,
+      marketplaceListingBeefsCollection: marketplaceListingBeefsCollection!
     };
   }
 
@@ -107,7 +110,8 @@ async function connectToMongo() {
       battleHistoryCollection: battleHistoryCollection!,
       playerStatsCollection: playerStatsCollection!,
       materialTokensCollection: materialTokensCollection!,
-      marketplaceItemsCollection: marketplaceItemsCollection!
+      marketplaceItemsCollection: marketplaceItemsCollection!,
+      marketplaceListingBeefsCollection: marketplaceListingBeefsCollection!
     };
   }
 
@@ -136,6 +140,7 @@ async function connectToMongo() {
       playerStatsCollection = db.collection<PlayerStats>(COLLECTIONS.PLAYER_STATS);
       materialTokensCollection = db.collection<MaterialToken>(COLLECTIONS.MATERIAL_TOKENS);
       marketplaceItemsCollection = db.collection<MarketplaceItem>(COLLECTIONS.MARKETPLACE_ITEMS);
+      marketplaceListingBeefsCollection = db.collection<MarketplaceListingBeef>(COLLECTIONS.MARKETPLACE_LISTING_BEEFS);
 
       // Only create indexes once (not on every connection)
       if (!collectionsInitialized) {
@@ -219,6 +224,9 @@ async function connectToMongo() {
           marketplaceItemsCollection.createIndex({ rarity: 1, status: 1 }), // Filter by rarity
           marketplaceItemsCollection.createIndex({ tier: 1, status: 1 }), // Filter by tier
           marketplaceItemsCollection.createIndex({ itemName: 1 }), // Regular index for name search
+
+          // Marketplace listing BEEF backups, keyed by listingId
+          safeCreateIndex(marketplaceListingBeefsCollection, { listingId: 1 }, { unique: true }),
         ]);
 
         collectionsInitialized = true;
@@ -250,7 +258,8 @@ async function connectToMongo() {
     battleHistoryCollection: battleHistoryCollection!,
     playerStatsCollection: playerStatsCollection!,
     materialTokensCollection: materialTokensCollection!,
-    marketplaceItemsCollection: marketplaceItemsCollection!
+    marketplaceItemsCollection: marketplaceItemsCollection!,
+    marketplaceListingBeefsCollection: marketplaceListingBeefsCollection!
   };
 }
 

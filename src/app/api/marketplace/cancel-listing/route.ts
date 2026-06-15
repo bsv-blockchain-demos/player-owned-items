@@ -5,7 +5,7 @@ import { connectToMongo } from '@/lib/mongodb';
 import { ObjectId } from 'mongodb';
 import { OrdinalsP2PKH } from '@/utils/ordinalP2PKH';
 import { Transaction, PublicKey } from '@bsv/sdk';
-import { getTransactionByTxID } from '@/utils/overlayFunctions';
+import { decodeBeef } from '@/utils/beefEncoding';
 
 /**
  * POST /api/marketplace/cancel-listing
@@ -26,7 +26,7 @@ export async function POST(request: NextRequest) {
     const userId = payload.userId as string;
 
     const body = await request.json();
-    const { listingId, returnTokenId } = body;
+    const { listingId, returnTokenId, cancelBeef, keyId, counterparty } = body;
 
     // Validate required fields
     if (!listingId || !returnTokenId) {
@@ -36,7 +36,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const { marketplaceItemsCollection, userInventoryCollection, materialTokensCollection, nftLootCollection } = await connectToMongo();
+    const { marketplaceItemsCollection, marketplaceListingBeefsCollection, userInventoryCollection, materialTokensCollection, nftLootCollection } = await connectToMongo();
 
     // Fetch the listing
     const listing = await marketplaceItemsCollection.findOne({
@@ -82,15 +82,11 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const cancelTxData = await getTransactionByTxID(cancelTxId);
-    if (!cancelTxData?.outputs?.[returnVout]?.beef) {
-      return NextResponse.json(
-        { error: `Could not find cancel transaction: ${cancelTxId}` },
-        { status: 400 }
-      );
+    // Validate from the client-posted BEEF
+    if (!cancelBeef) {
+      return NextResponse.json({ error: 'Missing cancelBeef' }, { status: 400 });
     }
-
-    const cancelTx = Transaction.fromBEEF(cancelTxData.outputs[returnVout].beef);
+    const cancelTx = Transaction.fromBEEF(decodeBeef(cancelBeef));
 
     const spendsOrdLock = cancelTx.inputs.some(i => {
       const inTxid = i.sourceTXID || i.sourceTransaction?.id('hex');
@@ -124,6 +120,9 @@ export async function POST(request: NextRequest) {
       }
     );
 
+    // Listing spent — drop the BEEF backup.
+    await marketplaceListingBeefsCollection.deleteOne({ listingId });
+
     // Update item tokenId in inventory or material tokens
     if (listing.inventoryItemId) {
       const inv = await userInventoryCollection.findOne({ _id: new ObjectId(listing.inventoryItemId), userId });
@@ -132,6 +131,8 @@ export async function POST(request: NextRequest) {
         {
           $set: {
             tokenId: returnTokenId,
+            keyId,
+            counterparty,
             updatedAt: new Date(),
           }
         }
@@ -143,6 +144,8 @@ export async function POST(request: NextRequest) {
           {
             $set: {
               tokenId: returnTokenId,
+              keyId,
+              counterparty,
               updatedAt: new Date(),
             }
           }
@@ -154,6 +157,8 @@ export async function POST(request: NextRequest) {
         {
           $set: {
             tokenId: returnTokenId,
+            keyId,
+            counterparty,
             updatedAt: new Date(),
           }
         }
