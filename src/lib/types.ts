@@ -110,6 +110,8 @@ export interface UserInventory {
   // Blockchain token tracking
   tokenId?: string;         // Current token location (outpoint: "txid.vout") after transfers
   mintOutpoint?: string;    // Original server mint proof (outpoint: "txid.vout")
+  keyId?: string;           // Nonce used to derive the key locking this token (absent = legacy)
+  counterparty?: string;    // Derivation counterparty (server identity key)
 
   // Equipment Customization (Phase 1: Inscriptions)
   prefix?: Inscription;     // Prefix inscription (e.g., "Savage" +5 damage)
@@ -419,6 +421,8 @@ export interface MaterialToken {
   transactionId?: string;  // DEPRECATED: Use tokenId instead (redundant, can be extracted from tokenId)
   quantity: number;        // Current quantity of this material
   metadata?: Record<string, any>; // Token metadata
+  keyId?: string;          // Nonce used to derive the key locking this token (absent = legacy fixed key)
+  counterparty?: string;   // Derivation counterparty (the server identity key that locked to user)
   mintOutpoint?: string;   // Server mint outpoint (txid.vout) - proves server minted token
   transferTransactionId?: string; // DEPRECATED: Use mintOutpoint/tokenId instead (redundant)
   consumed?: boolean;      // True if token was burned (quantity reached 0)
@@ -487,4 +491,17 @@ export interface MarketplaceItem {
   isEmpowered?: boolean;      // True if dropped by corrupted monster (+20% stats)
   prefix?: any;               // Prefix inscription
   suffix?: any;               // Suffix inscription
+}
+
+/**
+ * Base64 BEEF backup of a listing's orderLock tx, in its own collection so the
+ * marketplace_items docs stay small/fast for browse queries. Lets purchase/cancel
+ * spend the orderLock UTXO without depending on the overlay. Removed on sold/cancelled.
+ */
+export interface MarketplaceListingBeef {
+  _id?: ObjectId;
+  listingId: string;       // Reference to MarketplaceItem._id (string)
+  ordLockOutpoint: string; // The listing's orderLock outpoint (txid.vout)
+  beef: string;            // base64 BEEF of the listing tx
+  createdAt: Date;
 }

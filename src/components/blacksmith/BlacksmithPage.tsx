@@ -27,6 +27,8 @@ interface InventoryItem {
   nftLootId?: string;
   tokenId?: string;
   transactionId?: string;
+  keyId?: string;
+  counterparty?: string;
 }
 
 export default function BlacksmithPage() {
@@ -72,8 +74,10 @@ export default function BlacksmithPage() {
           isEmpowered: item.isEmpowered,
           isMinted: item.isMinted,
           nftLootId: item.nftLootId,
-          tokenId: item.currentTokenId || item.tokenId, // currentTokenId for equipment/scrolls, tokenId for materials
-          transactionId: item.mintTransactionId || item.transactionId // mintTransactionId for equipment/scrolls, transactionId for materials
+          tokenId: item.currentTokenId || item.tokenId,
+          transactionId: item.mintTransactionId || item.transactionId,
+          keyId: item.keyId,
+          counterparty: item.counterparty,
         }));
 
         // Separate equipment and scrolls (backend already filters for minted items)
@@ -177,8 +181,10 @@ export default function BlacksmithPage() {
               value: selectedEquipment.suffix.value,
               name: selectedEquipment.suffix.name
             } : undefined,
+            keyId: selectedEquipment.keyId,
+            counterparty: selectedEquipment.counterparty,
           },
-          inscriptionScrolls: [{  // Now an array for batched transfers
+          inscriptionScrolls: [{
             inventoryItemId: selectedScroll._id,
             nftLootId: selectedScroll.nftLootId!,
             tokenId: selectedScroll.tokenId!,
@@ -195,8 +201,10 @@ export default function BlacksmithPage() {
               slot: scrollData.inscriptionData.slot,
               name: scrollData.inscriptionData.name,
               description: scrollData.inscriptionData.description
-            }
-          }],  // Array allows future support for applying multiple scrolls at once
+            },
+            keyId: selectedScroll.keyId,
+            counterparty: selectedScroll.counterparty,
+          }],
         });
 
         if (!result.success) {

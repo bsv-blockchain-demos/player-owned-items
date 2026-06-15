@@ -1,26 +1,19 @@
-/**
- * Server-Side Mint and Transfer Flow
- *
- * This replaces client-side minting with a secure server-controlled flow:
- * 1. Validate user owns the items (loot drop, crafting materials, etc.)
- * 2. Server wallet mints the item (server is source of truth)
- * 3. Store mintOutpoint in NFTLoot table (proof of legitimate mint)
- * 4. Server immediately transfers to user's public key
- * 5. Store transferTransactionId in NFTLoot table
- *
- * This prevents fraudulent items and fixes SIGHASH complexities.
- */
+// Single-tx mint: server builds/funds/signs one deploy+mint locked directly to
+// the user's recipient-derived key (so mintOutpoint === tokenId). Returns the
+// BEEF + nonce for the client to internalize into its wallet basket.
 
 import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 import { verifyJWT } from '@/utils/jwt';
 import { connectToMongo } from '@/lib/mongodb';
-import { getServerWallet, getServerPublicKey } from '@/lib/serverWallet';
+import { getServerWallet, getServerIdentityPublicKey } from '@/lib/serverWallet';
 import { OrdinalsP2PKH } from '@/utils/ordinalP2PKH';
 import { Transaction } from '@bsv/sdk';
 import { WalletP2PKH } from '@bsv/wallet-helper';
 import { ObjectId } from 'mongodb';
-import { broadcastTX, getTransactionByTxID } from '@/utils/overlayFunctions';
+import { broadcastTX } from '@/utils/overlayFunctions';
+import { decodeBeef, encodeBeef } from '@/utils/beefEncoding';
+import { generateNonce, deriveRecipientKey } from '@/utils/tokenDerivation';
 
 export async function POST(request: NextRequest) {
   try {
@@ -43,13 +36,13 @@ export async function POST(request: NextRequest) {
     const {
       inventoryItemId,  // UserInventory document ID (validate ownership)
       itemData,         // Full item metadata for minting
-      userPublicKey,    // User's public key for transfer
-      paymentTx,        // User's payment transaction BEEF (WalletP2PKH locked)
+      userIdentityKey,  // User's IDENTITY key — the derivation counterparty
+      paymentTx,        // base64 WalletP2PKH payment BEEF
       walletParams,     // Wallet derivation params for unlocking { protocolID, keyID, counterparty }
     } = body;
 
     // Validate required fields
-    if (!inventoryItemId || !itemData || !userPublicKey) {
+    if (!inventoryItemId || !itemData || !userIdentityKey) {
       return NextResponse.json(
         { error: 'Missing required fields' },
         { status: 400 }
@@ -94,10 +87,10 @@ export async function POST(request: NextRequest) {
 
     // 4. Get server wallet
     const serverWallet = await getServerWallet();
-    const serverPublicKey = await getServerPublicKey();
 
-    // 5. Parse and validate payment transaction
-    const paymentTransaction = Transaction.fromBEEF(paymentTx);
+    // 5. Decode base64 payment BEEF and parse the payment transaction
+    const paymentBeef = decodeBeef(paymentTx);
+    const paymentTransaction = Transaction.fromBEEF(paymentBeef);
     const paymentTxId = paymentTransaction.id('hex');
 
     console.log('📥 [PAYMENT] Received WalletP2PKH payment transaction:', {
@@ -141,35 +134,24 @@ export async function POST(request: NextRequest) {
       counterparty: walletParams.counterparty,
     });
 
-    console.log('Server minting item:', {
-      itemName: itemData.name,
-      userId,
-      serverPublicKey,
-      paymentAmount: paymentOutput.satoshis,
-      paymentOutpoint,
-    });
-
-    // 6. STEP 1: Server mints the item (with payment input for fees)
+    // Mint directly to the user's recipient-derived key (single tx).
     const ordinalP2PKH = new OrdinalsP2PKH();
-    const mintLockingScript = ordinalP2PKH.lock(
-      serverPublicKey,
-      '',                // Empty for new mint
-      itemData,          // Full item metadata
-      'deploy+mint'
-    );
+    const nonce = generateNonce();
+    const serverIdentityKey = await getServerIdentityPublicKey();
+    const userKey = await deriveRecipientKey(serverWallet, userIdentityKey, nonce);
+    const mintLockingScript = ordinalP2PKH.lock(userKey, '', itemData, 'deploy+mint');
 
-    console.log('🔨 [MINT-ITEM] Creating mint locking script:', {
+    console.log('🔨 [MINT-ITEM] Creating deploy+mint locked to user:', {
       operation: 'deploy+mint',
-      publicKey: serverPublicKey,
+      userKey,
       itemName: itemData.itemName || itemData.name,
       scriptLength: mintLockingScript.toHex().length,
-      scriptHex: mintLockingScript.toHex(),
     });
 
     // Step 1: Call createAction with unlockingScriptLength
     const mintActionRes = await serverWallet.createAction({
       description: "Server minting item NFT with user WalletP2PKH payment",
-      inputBEEF: paymentTx,
+      inputBEEF: paymentBeef,
       inputs: [
         {
           inputDescription: "User WalletP2PKH payment for fees",
@@ -246,140 +228,10 @@ export async function POST(request: NextRequest) {
       throw new Error('Failed to get transaction ID from broadcast');
     }
 
-    const mintOutpoint = `${mintTxId}.0`;
+    const tokenId = `${mintTxId}.0`; // mint proof and current location are the same outpoint
 
-    console.log('✅ [MINT] Server minted item:', {
-      mintTxId,
-      mintOutpoint,
-      broadcastResponse: mintBroadcast
-    });
+    console.log('✅ [MINT] Minted item directly to user:', { mintTxId, tokenId, nonce });
 
-    // 6. STEP 2: Server immediately transfers to user
-    // Fetch the mint transaction for spending
-    const mintTxData = await getTransactionByTxID(mintTxId);
-
-    if (!mintTxData || !mintTxData.outputs || !mintTxData.outputs[0] || !mintTxData.outputs[0].beef) {
-      throw new Error(`Could not find mint transaction: ${mintTxId}`);
-    }
-
-    const mintTransaction = Transaction.fromBEEF(mintTxData.outputs[0].beef!);
-
-    console.log('🔓 [TRANSFER] Creating unlocking script template for mint output:', {
-      mintOutpoint,
-      sighashType: 'all',
-      anyoneCanPay: false,
-    });
-
-    // Create unlocking script template for server wallet (using 'all' and false)
-    const unlockTemplate = ordinalP2PKH.unlock(serverWallet, "all", false);
-    const unlockingScriptLength = await unlockTemplate.estimateLength();
-
-    console.log('🔓 [TRANSFER] Unlocking script template created:', {
-      unlockingScriptLength,
-    });
-
-    // Create transfer locking script to user
-    const assetId = mintOutpoint.replace('.', '_'); // BSV-21 format
-    const transferLockingScript = ordinalP2PKH.lock(
-      userPublicKey,     // Lock to user's public key
-      assetId,           // Reference the mint
-      itemData,          // Item metadata (game data only)
-      'transfer'
-    );
-
-    console.log('🔒 [TRANSFER] Creating transfer locking script:', {
-      operation: 'transfer',
-      assetId,
-      userPublicKey: userPublicKey,
-      scriptLength: transferLockingScript.toHex().length,
-      scriptHex: transferLockingScript.toHex(),
-    });
-
-    // Step 1: Call createAction with unlockingScriptLength
-    const transferActionRes = await serverWallet.createAction({
-      description: "Transferring minted item to user",
-      inputBEEF: mintTxData.outputs[0].beef,
-      inputs: [
-        {
-          inputDescription: "Server minted item",
-          outpoint: mintOutpoint,
-          unlockingScriptLength,
-        }
-      ],
-      outputs: [
-        {
-          outputDescription: "Transfer to user",
-          lockingScript: transferLockingScript.toHex(),
-          satoshis: 1,
-        }
-      ],
-      options: {
-        randomizeOutputs: false,
-        acceptDelayedBroadcast: false,
-      }
-    });
-
-    if (!transferActionRes.signableTransaction) {
-      throw new Error('Failed to create signable transaction');
-    }
-
-    // Step 2: Extract signable transaction and sign it
-    const reference = transferActionRes.signableTransaction.reference;
-    const txToSign = Transaction.fromBEEF(transferActionRes.signableTransaction.tx);
-
-    // Add unlocking script template and source transaction
-    txToSign.inputs[0].unlockingScriptTemplate = unlockTemplate;
-    txToSign.inputs[0].sourceTransaction = mintTransaction;
-
-    // Sign the transaction
-    await txToSign.sign();
-
-    // Extract the unlocking script
-    const unlockingScript = txToSign.inputs[0].unlockingScript;
-    if (!unlockingScript) {
-      throw new Error('Missing unlocking script after signing');
-    }
-
-    console.log('🔓 [TRANSFER] Transaction signed, unlocking script generated:', {
-      scriptLength: unlockingScript.toHex().length,
-      scriptHex: unlockingScript.toHex(),
-    });
-
-    // Step 3: Sign the action with actual unlocking scripts
-    const transferAction = await serverWallet.signAction({
-      reference,
-      spends: {
-        '0': { unlockingScript: unlockingScript.toHex() }
-      }
-    });
-
-    if (!transferAction.tx) {
-      throw new Error('Failed to sign transfer action');
-    }
-
-    // Broadcast transfer transaction
-    const transferTx = Transaction.fromAtomicBEEF(transferAction.tx);
-
-    console.log('📦 [TRANSFER] Transaction structure before broadcast:', {
-      txid: transferTx.id('hex'),
-      inputs: transferTx.inputs.length,
-      outputs: transferTx.outputs.length,
-      inputOutpoints: transferTx.inputs.map(i => `${i.sourceTXID}.${i.sourceOutputIndex}`),
-      outputSatoshis: transferTx.outputs.map(o => o.satoshis),
-      txHex: transferTx.toHex(),
-    });
-
-    const transferBroadcast = await broadcastTX(transferTx);
-    const transferTxId = transferBroadcast.txid;
-    const userTokenId = `${transferTxId}.0`;
-
-    console.log('✅ [TRANSFER] Transferred to user:', {
-      transferTxId,
-      userTokenId,
-      broadcastResponse: transferBroadcast
-    });
-
-    // 7. Create NFTLoot document with mint proof and current location
     const nftLootDoc = {
       lootTableId: inventoryItem.lootTableId,
       name: itemData.name || itemData.itemName,
@@ -388,22 +240,24 @@ export async function POST(request: NextRequest) {
       rarity: itemData.rarity,
       type: inventoryItem.itemType,
       attributes: itemData,
-      mintOutpoint: mintOutpoint,          // Proof of original mint: ${mintTxId}.0
-      tokenId: userTokenId,                // Current location: ${transferTxId}.0
+      mintOutpoint: tokenId,
+      tokenId: tokenId,
       createdAt: new Date(),
     };
 
     const nftResult = await nftLootCollection.insertOne(nftLootDoc);
     const nftLootId = nftResult.insertedId.toString();
 
-    // 8. Update UserInventory with NFT reference and outpoints
+    // Persist outpoint + derivation index on the inventory item.
     await userInventoryCollection.updateOne(
       { _id: new ObjectId(inventoryItemId) },
       {
         $set: {
           nftLootId: nftResult.insertedId,
-          mintOutpoint: mintOutpoint,    // Proof of original server mint
-          tokenId: userTokenId,          // Current location after transfer
+          mintOutpoint: tokenId,
+          tokenId: tokenId,
+          keyId: nonce,
+          counterparty: serverIdentityKey,
           updatedAt: new Date(),
         }
       }
@@ -412,8 +266,15 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       success: true,
       nftId: nftLootId,
-      tokenId: userTokenId,      // Full outpoint: ${transferTxId}.0
-      mintOutpoint: mintOutpoint, // Full outpoint: ${mintTxId}.0
+      tokenId: tokenId,
+      mintOutpoint: tokenId,
+      transferBeef: encodeBeef(Array.from(mintAction.tx!)),
+      received: {
+        outputIndex: 0,
+        keyId: nonce,
+        counterparty: serverIdentityKey,
+        tags: ['type:item'],
+      },
     });
 
   } catch (error) {

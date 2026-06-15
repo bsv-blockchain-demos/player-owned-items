@@ -3,12 +3,14 @@ import { cookies } from 'next/headers';
 import { verifyJWT } from '@/utils/jwt';
 import { connectToMongo } from '@/lib/mongodb';
 import { ObjectId } from 'mongodb';
-import { getServerWallet } from '@/lib/serverWallet';
+import { getServerWallet, getServerIdentityPublicKey } from '@/lib/serverWallet';
 import { WalletOrdLock } from '@bsv/wallet-helper';
 import { OrdinalsP2PKH } from '@/utils/ordinalP2PKH';
 import { Beef, Transaction, Script, P2PKH } from '@bsv/sdk';
 import { broadcastTX, getTransactionByTxID } from '@/utils/overlayFunctions';
 import { WalletP2PKH } from '@bsv/wallet-helper';
+import { decodeBeef, encodeBeef } from '@/utils/beefEncoding';
+import { generateNonce, deriveRecipientKey } from '@/utils/tokenDerivation';
 
 /**
  * POST /api/marketplace/purchase-listing
@@ -34,20 +36,20 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const {
       listingId,
-      buyerPublicKey,
+      buyerIdentityKey,
       paymentTx,
       walletParams,
     } = body;
 
     // Validate required fields
-    if (!listingId || !buyerPublicKey || !paymentTx || !walletParams) {
+    if (!listingId || !buyerIdentityKey || !paymentTx || !walletParams) {
       return NextResponse.json(
-        { error: 'Missing required fields: listingId, buyerPublicKey, paymentTx, walletParams' },
+        { error: 'Missing required fields: listingId, buyerIdentityKey, paymentTx, walletParams' },
         { status: 400 }
       );
     }
 
-    const { marketplaceItemsCollection, userInventoryCollection, materialTokensCollection, usersCollection } = await connectToMongo();
+    const { marketplaceItemsCollection, marketplaceListingBeefsCollection, userInventoryCollection, materialTokensCollection, usersCollection } = await connectToMongo();
 
     // Fetch the listing
     const listing = await marketplaceItemsCollection.findOne({
@@ -89,8 +91,9 @@ export async function POST(request: NextRequest) {
 
     const serverWallet = await getServerWallet();
 
-    // Parse payment transaction
-    const paymentTransaction = Transaction.fromBEEF(paymentTx);
+    // Parse payment transaction (client sends base64 BEEF)
+    const paymentBeef = decodeBeef(paymentTx);
+    const paymentTransaction = Transaction.fromBEEF(paymentBeef);
     const paymentTxId = paymentTransaction.id('hex');
     const paymentOutpoint = `${paymentTxId}.0`;
 
@@ -99,21 +102,25 @@ export async function POST(request: NextRequest) {
       paymentOutpoint,
     });
 
-    // Fetch the OrdLock transaction for spending
-    const [ordLockTxId, ordLockVout] = listing.ordLockOutpoint.split('.');
-    const ordLockTxData = await getTransactionByTxID(ordLockTxId);
-
-    if (!ordLockTxData || !ordLockTxData.outputs || !ordLockTxData.outputs[parseInt(ordLockVout)] || !ordLockTxData.outputs[parseInt(ordLockVout)].beef) {
-      throw new Error(`Could not find OrdLock transaction: ${ordLockTxId}`);
+    // Resolve the listing tx: DB backup first, overlay as fallback.
+    const [ordLockTxId, ordLockVoutStr] = String(listing.ordLockOutpoint).split('.');
+    const beefDoc = await marketplaceListingBeefsCollection.findOne({ listingId });
+    let ordLockTransaction: Transaction;
+    if (beefDoc?.beef) {
+      ordLockTransaction = Transaction.fromBEEF(decodeBeef(beefDoc.beef));
+    } else {
+      const ordLockTxData = await getTransactionByTxID(ordLockTxId);
+      const overlayBeef = ordLockTxData?.outputs?.[parseInt(ordLockVoutStr, 10)]?.beef;
+      if (!overlayBeef) {
+        throw new Error('Listing tx not found in DB backup or overlay');
+      }
+      ordLockTransaction = Transaction.fromBEEF(overlayBeef);
     }
-
-    const ordLockTransaction = Transaction.fromBEEF(ordLockTxData.outputs[parseInt(ordLockVout)].beef!);
     const ordLockScript = Script.fromHex(listing.ordLockScript);
 
-    console.log('📥 [PURCHASE-LISTING] OrdLock transaction:', {
-      txid: ordLockTxId,
-      vout: ordLockVout,
+    console.log('📥 [PURCHASE-LISTING] OrdLock resolved:', {
       ordLockOutpoint: listing.ordLockOutpoint,
+      source: beefDoc?.beef ? 'db' : 'overlay',
     });
 
     // Create purchase unlock template
@@ -125,10 +132,15 @@ export async function POST(request: NextRequest) {
 
     console.log('🔓 [PURCHASE-LISTING] Created purchase unlock template');
 
-    // Create transfer locking script (item to buyer)
+    // Derive recipient key for output 0 (token to buyer)
+    const purchaseNonce = generateNonce();
+    const serverIdentityKey = await getServerIdentityPublicKey();
+    const buyerKey = await deriveRecipientKey(serverWallet, buyerIdentityKey, purchaseNonce);
+
+    // Create transfer locking script (item to buyer, locked to derived key)
     const ordinalP2PKH = new OrdinalsP2PKH();
     const transferLockingScript = ordinalP2PKH.lock(
-      buyerPublicKey,
+      buyerKey,
       listing.assetId,
       listing, // Item metadata
       'transfer'
@@ -137,7 +149,7 @@ export async function POST(request: NextRequest) {
     console.log('🔒 [PURCHASE-LISTING] Created transfer locking script:', {
       operation: 'transfer',
       assetId: listing.assetId,
-      buyerPublicKey,
+      buyerKey,
       scriptLength: transferLockingScript.toHex().length,
     });
 
@@ -189,7 +201,7 @@ export async function POST(request: NextRequest) {
 
     const mergedBeef = new Beef();
     mergedBeef.mergeBeef(ordLockTransaction.toBEEF());
-    mergedBeef.mergeBeef(paymentTransaction.toBEEF());
+    mergedBeef.mergeBeef(paymentBeef);
     const inputBEEF = mergedBeef.toBinary();
 
     // STEP 1: createAction - Prepare transaction
@@ -317,6 +329,9 @@ export async function POST(request: NextRequest) {
       }
     );
 
+    // Listing spent — drop the BEEF backup.
+    await marketplaceListingBeefsCollection.deleteOne({ listingId });
+
     // Get buyer user info
     const buyerUser = await usersCollection.findOne({ userId });
     if (!buyerUser) {
@@ -332,6 +347,8 @@ export async function POST(request: NextRequest) {
           $set: {
             userId: userId, // New owner
             tokenId: buyerTokenId,
+            keyId: purchaseNonce,
+            counterparty: serverIdentityKey,
             updatedAt: new Date(),
           }
         }
@@ -344,6 +361,8 @@ export async function POST(request: NextRequest) {
           $set: {
             userId: userId, // New owner
             tokenId: buyerTokenId,
+            keyId: purchaseNonce,
+            counterparty: serverIdentityKey,
             updatedAt: new Date(),
           }
         }
@@ -362,6 +381,13 @@ export async function POST(request: NextRequest) {
       success: true,
       buyerTokenId,
       message: `${listing.itemName} purchased for ${listing.price} satoshis`,
+      transferBeef: encodeBeef(Array.from(action.tx!)),
+      received: {
+        outputIndex: 0,
+        keyId: purchaseNonce,
+        counterparty: serverIdentityKey,
+        tags: [listing.materialTokenId ? 'type:material' : 'type:item'],
+      },
     });
 
   } catch (error) {

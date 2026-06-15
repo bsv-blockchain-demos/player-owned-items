@@ -27,12 +27,26 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid token: missing userId' }, { status: 401 });
     }
 
-    // Check for mintedOnly query parameter
+    // Check query parameters
     const { searchParams } = new URL(request.url);
     const mintedOnly = searchParams.get('mintedOnly') === 'true';
+    const excludeListed = searchParams.get('excludeListed') === 'true';
 
     // Ensure MongoDB is connected and get collections
-    const { userInventoryCollection, nftLootCollection, materialTokensCollection } = await connectToMongo();
+    const { userInventoryCollection, nftLootCollection, materialTokensCollection, marketplaceItemsCollection } = await connectToMongo();
+
+    // Items with an active listing are escrowed in an orderLock and not sellable again
+    const listedInventoryIds = new Set<string>();
+    const listedMaterialIds = new Set<string>();
+    if (excludeListed) {
+      const activeListings = await marketplaceItemsCollection
+        .find({ sellerId: userId, status: 'active' })
+        .toArray();
+      for (const l of activeListings) {
+        if (l.inventoryItemId) listedInventoryIds.add(l.inventoryItemId);
+        if (l.materialTokenId) listedMaterialIds.add(l.materialTokenId);
+      }
+    }
 
     // Build query for inventory items
     const inventoryQuery: any = { userId };
@@ -42,10 +56,11 @@ export async function GET(request: NextRequest) {
     }
 
     // Fetch inventory items for this user
-    const inventoryItems = await userInventoryCollection
+    const inventoryItems = (await userInventoryCollection
       .find(inventoryQuery)
       .sort({ acquiredAt: -1 }) // Most recent first
-      .toArray();
+      .toArray())
+      .filter(item => !listedInventoryIds.has(item._id!.toString()));
 
     // Build query for material tokens
     const materialTokenQuery: any = { userId, consumed: { $ne: true } };
@@ -55,9 +70,10 @@ export async function GET(request: NextRequest) {
     }
 
     // Fetch material tokens for this user (minted materials with quantity)
-    const materialTokens = await materialTokensCollection
+    const materialTokens = (await materialTokensCollection
       .find(materialTokenQuery)
-      .toArray();
+      .toArray())
+      .filter(token => !listedMaterialIds.has(token._id!.toString()));
 
     // Build inventory by getting loot data from loot-table
     const inventory = inventoryItems.map((inventoryItem) => {
@@ -85,9 +101,11 @@ export async function GET(request: NextRequest) {
         statRoll: inventoryItem.statRoll, // Stat roll multiplier (0.8 to 1.2) for crafted items
         isEmpowered: inventoryItem.isEmpowered, // True if from corrupted monster (+20% stats)
         equipmentStats: lootTemplate.equipmentStats, // Include equipment stats for display
-        prefix: inventoryItem.prefix, // Phase 3.4: Prefix inscription
-        suffix: inventoryItem.suffix, // Phase 3.4: Suffix inscription
-        enhanced: inventoryItem.enhanced || false // Phase 3.5: Enhanced consumables (infinite uses)
+        prefix: inventoryItem.prefix,
+        suffix: inventoryItem.suffix,
+        enhanced: inventoryItem.enhanced || false,
+        keyId: inventoryItem.keyId,
+        counterparty: inventoryItem.counterparty,
       };
     }).filter(item => item !== null); // Filter out any items not found
 
@@ -166,14 +184,16 @@ export async function GET(request: NextRequest) {
         borderGradient: undefined, // Materials don't have gradients
         isMinted: !!token.tokenId, // True if on blockchain
         quantity: token.quantity, // Material token quantity
-        isMaterialToken: true, // Flag to distinguish from regular inventory items
+        isMaterialToken: true,
         crafted: false,
         statRoll: undefined,
         isEmpowered: false,
         equipmentStats: undefined,
         prefix: undefined,
         suffix: undefined,
-        enhanced: false
+        enhanced: false,
+        keyId: token.keyId,
+        counterparty: token.counterparty,
       };
     }).filter(item => item !== null);
 

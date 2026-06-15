@@ -9,7 +9,7 @@ import { connectToMongo } from '@/lib/mongodb';
  * POST /api/materials/check-token
  * Body: { lootTableId: string, tier: number }
  *
- * Returns: { exists: boolean, token?: { tokenId, quantity } }
+ * Returns: { exists: boolean, token?: { tokenId, quantity, keyId, counterparty } }
  */
 export async function POST(request: NextRequest) {
   try {
@@ -59,6 +59,8 @@ export async function POST(request: NextRequest) {
         token: {
           tokenId: existingToken.tokenId,
           quantity: existingToken.quantity,
+          keyId: existingToken.keyId,
+          counterparty: existingToken.counterparty,
         },
       });
     } else {

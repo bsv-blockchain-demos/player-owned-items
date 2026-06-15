@@ -187,6 +187,8 @@ export default function InventoryDetailsModal({ item, onClose, onMintSuccess, on
             tier: item.tier || 1,
             currentTokenId: existingToken.tokenId,
             currentQuantity: existingToken.quantity,
+            keyId: existingToken.keyId,
+            counterparty: existingToken.counterparty,
             operation: 'add',
             quantity: quantity,
             inventoryItemIds: inventoryItemIds,  // Pass IDs to consume
@@ -267,6 +269,8 @@ export default function InventoryDetailsModal({ item, onClose, onMintSuccess, on
                   tier: item.tier || 1,
                   currentTokenId: recheckToken.tokenId,
                   currentQuantity: recheckToken.quantity,
+                  keyId: recheckToken.keyId,
+                  counterparty: recheckToken.counterparty,
                   operation: 'add',
                   quantity: quantity,
                   inventoryItemIds: inventoryItemIds,

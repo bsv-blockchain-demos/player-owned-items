@@ -1,41 +1,13 @@
 import { useState, useCallback } from 'react';
 import { WalletClient } from '@bsv/sdk';
 import { createWalletPayment } from '@/utils/createWalletPayment';
+import { internalizeToBasket } from '@/utils/internalizeToBasket';
+import { encodeBeef, decodeBeef } from '@/utils/beefEncoding';
 
 /**
- * Hook for creating material tokens on the BSV blockchain
- *
- * Material tokens are fungible-like tokens that track quantities of materials.
- * Uses SERVER-SIDE minting architecture where:
- * 1. Client creates WalletP2PKH payment to server (with derivation params)
- * 2. Server wallet mints material tokens (single source of truth)
- * 3. Server stores mintOutpoint (proof of legitimate mint)
- * 4. Server immediately transfers to user
- * 5. Server stores transferTransactionId
- *
- * This prevents fraudulent materials and simplifies SIGHASH handling.
- *
- * Payment System:
- * - Uses WalletP2PKH (not plain P2PKH) for proper derivation
- * - Client provides protocolID, keyID, and counterparty for unlocking
- * - Server can unlock using wallet parameters and source transaction
- *
- * Features:
- * - One token per material type per user (e.g., one "Iron Ore" token with quantity)
- * - Quantity tracking on-chain
- * - Batch creation for multiple material types
- * - Provenance tracking via acquiredFrom array
- *
- * @example
- * const { createMaterialToken, isCreating, error } = useCreateMaterialToken();
- *
- * const result = await createMaterialToken({
- *   wallet: connectedWallet,
- *   materials: [
- *     { lootTableId: 'iron_ore', name: 'Iron Ore', quantity: 10, ... },
- *     { lootTableId: 'coal', name: 'Coal', quantity: 5, ... },
- *   ],
- * });
+ * Hook for creating material tokens on the BSV blockchain.
+ * Single-tx mint: server mints directly to user's recipient-derived key.
+ * Client internalizes the returned BEEF into its wallet basket (non-fatal).
  */
 
 export interface MaterialTokenData {
@@ -57,7 +29,7 @@ export interface MaterialTokenData {
 
 export interface CreateMaterialTokenParams {
   wallet: WalletClient;
-  materials: MaterialTokenData[]; // Support batch creation
+  materials: MaterialTokenData[]; // Must be length 1
 }
 
 export interface MaterialTokenResult {
@@ -73,26 +45,13 @@ export interface CreateMaterialTokenResult {
   results: MaterialTokenResult[];
   success: boolean;
   error?: string;
+  internalizeWarning?: string; // Set when mint succeeded but wallet basket adoption failed (recoverable)
 }
 
 export function useCreateMaterialToken() {
   const [isCreating, setIsCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  /**
-   * Create material tokens on the BSV blockchain
-   *
-   * Server-side minting process:
-   * 1. Validate wallet connection and get user's public key
-   * 2. Call server API with materials data and user's public key
-   * 3. Server mints each material token (proof via mintOutpoint)
-   * 4. Server immediately transfers each token to user
-   * 5. Server creates MaterialToken documents
-   * 6. Return token IDs and quantities
-   *
-   * @param params - Material data and wallet
-   * @returns Results for each material token created
-   */
   const createMaterialToken = useCallback(async (
     params: CreateMaterialTokenParams
   ): Promise<CreateMaterialTokenResult> => {
@@ -102,7 +61,14 @@ export function useCreateMaterialToken() {
     try {
       const { wallet, materials } = params;
 
-      // Validate wallet
+      // Validate inputs before doing any wallet work / charging the user.
+      if (materials.length !== 1) {
+        throw new Error('Only one material token can be minted at a time');
+      }
+      if (materials[0].quantity <= 0) {
+        throw new Error(`Invalid quantity for ${materials[0].itemName}: ${materials[0].quantity}`);
+      }
+
       if (!wallet) {
         throw new Error('Wallet not connected');
       }
@@ -112,11 +78,8 @@ export function useCreateMaterialToken() {
         throw new Error('Wallet not authenticated');
       }
 
-      // Get player public key
-      const { publicKey } = await wallet.getPublicKey({
-        protocolID: [0, "monsterbattle"],
-        keyID: "0",
-      });
+      // Identity key is the derivation counterparty the server locks toward
+      const { publicKey: userIdentityKey } = await wallet.getPublicKey({ identityKey: true });
 
       // Fetch server identity key for payment counterparty
       const serverPubKeyResponse = await fetch('/api/server-identity-key');
@@ -144,25 +107,10 @@ export function useCreateMaterialToken() {
       console.log('Requesting server-side mint for materials:', {
         materialCount: materials.length,
         materials: materials.map(m => `${m.itemName} x${m.quantity}`),
-        publicKey,
+        userIdentityKey,
         paymentTxId,
         walletParams,
       });
-
-      // Validate materials
-      if (materials.length === 0) {
-        throw new Error('No materials provided');
-      }
-
-      if (materials.length !== 1) {
-        throw new Error('Only one material token can be minted at a time');
-      }
-
-      for (const material of materials) {
-        if (material.quantity <= 0) {
-          throw new Error(`Invalid quantity for ${material.itemName}: ${material.quantity}`);
-        }
-      }
 
       // Call server API for mint-and-transfer
       const apiResult = await fetch('/api/materials/mint-and-transfer', {
@@ -179,23 +127,22 @@ export function useCreateMaterialToken() {
             rarity: material.rarity,
             tier: material.tier || 1,
             quantity: material.quantity,
-            inventoryItemIds: material.inventoryItemIds || [],  // IDs to consume
+            inventoryItemIds: material.inventoryItemIds || [],
             acquiredFrom: material.acquiredFrom || [],
           })),
-          userPublicKey: publicKey,
-          paymentTx,          // WalletP2PKH payment BEEF
-          walletParams,       // Derivation params for unlocking
+          userIdentityKey,
+          paymentTx: encodeBeef(paymentTx),  // base64 BEEF, symmetric with server decodeBeef
+          walletParams,
         }),
       });
 
       if (!apiResult.ok) {
         const errorData = await apiResult.json();
 
-        // If 409 Conflict (token already exists), this is expected
-        // Frontend should handle this by calling useUpdateMaterialToken instead
+        // 409 Conflict means token already exists — caller should use add-and-merge
         if (apiResult.status === 409 && errorData.shouldUseAddAndMerge) {
           console.warn('Token already exists, should use add-and-merge route:', errorData);
-          throw new Error('SWITCH_TO_ADD_AND_MERGE'); // Special error code for frontend
+          throw new Error('SWITCH_TO_ADD_AND_MERGE');
         }
 
         throw new Error(errorData.error || 'Failed to mint and transfer materials');
@@ -204,6 +151,23 @@ export function useCreateMaterialToken() {
       const response = await apiResult.json();
 
       console.log('Server minted and transferred materials:', response.results);
+
+      // Internalize the minted output into the wallet basket. Non-fatal: the token
+      // is already minted server-side, so a failure here is recoverable via reindexFromBasket.
+      let internalizeWarning: string | undefined;
+      if (typeof response.transferBeef === 'string' && response.received) {
+        try {
+          await internalizeToBasket(
+            wallet,
+            decodeBeef(response.transferBeef),
+            [response.received],
+            `Receive ${materials[0].itemName}`,
+          );
+        } catch (e) {
+          internalizeWarning = e instanceof Error ? e.message : 'Failed to record material in wallet';
+          console.warn('Material minted server-side but wallet internalize failed (recoverable via reindexFromBasket):', e);
+        }
+      }
 
       // Transform server response to match expected format
       const results: MaterialTokenResult[] = response.results.map((result: any) => ({
@@ -217,6 +181,7 @@ export function useCreateMaterialToken() {
       return {
         results,
         success: true,
+        internalizeWarning,
       };
 
     } catch (err) {

@@ -6,7 +6,7 @@ import { ObjectId } from 'mongodb';
 import { getLootItemById, LootItem, EquipmentStats } from '@/lib/loot-table';
 import { WalletOrdLock } from '@bsv/wallet-helper';
 import { Transaction, PublicKey } from '@bsv/sdk';
-import { getTransactionByTxID } from '@/utils/overlayFunctions';
+import { decodeBeef } from '@/utils/beefEncoding';
 
 /**
  * POST /api/marketplace/list-item
@@ -27,7 +27,7 @@ export async function POST(request: NextRequest) {
     const userId = payload.userId as string;
 
     const body = await request.json();
-    const { inventoryItemId, materialTokenId, price, userPublicKey, ordLockOutpoint, ordLockScript } = body;
+    const { inventoryItemId, materialTokenId, price, userPublicKey, ordLockOutpoint, ordLockScript, ordLockBeef } = body;
 
     // Validate price
     if (!price || isNaN(price) || price <= 0) {
@@ -55,7 +55,8 @@ export async function POST(request: NextRequest) {
       nftLootCollection,
       userInventoryCollection,
       materialTokensCollection,
-      marketplaceItemsCollection
+      marketplaceItemsCollection,
+      marketplaceListingBeefsCollection
     } = await connectToMongo();
 
     // Get user info
@@ -246,15 +247,11 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const listingTxData = await getTransactionByTxID(ordLockTxId);
-    if (!listingTxData?.outputs?.[ordLockVout]?.beef) {
-      return NextResponse.json(
-        { error: `Could not find listing transaction: ${ordLockTxId}` },
-        { status: 400 }
-      );
+    // Validate from the client-posted BEEF
+    if (!ordLockBeef) {
+      return NextResponse.json({ error: 'Missing ordLockBeef' }, { status: 400 });
     }
-
-    const listingTx = Transaction.fromBEEF(listingTxData.outputs[ordLockVout].beef);
+    const listingTx = Transaction.fromBEEF(decodeBeef(ordLockBeef));
 
     const hasTokenInput = listingTx.inputs.some(i => {
       const inTxid = i.sourceTXID || i.sourceTransaction?.id('hex');
@@ -305,7 +302,24 @@ export async function POST(request: NextRequest) {
       listedAt: new Date(),
     };
 
-    const result = await marketplaceItemsCollection.insertOne(marketplaceItem);
+    let result;
+    try {
+      result = await marketplaceItemsCollection.insertOne(marketplaceItem);
+    } catch (e: any) {
+      // Partial unique index rejected a concurrent duplicate active listing
+      if (e?.code === 11000) {
+        return NextResponse.json({ error: 'Item is already listed on marketplace' }, { status: 400 });
+      }
+      throw e;
+    }
+
+    // Back up the listing tx BEEF for overlay-independent spends.
+    await marketplaceListingBeefsCollection.insertOne({
+      listingId: result.insertedId.toString(),
+      ordLockOutpoint,
+      beef: ordLockBeef,
+      createdAt: new Date(),
+    });
 
     if (inventoryItemId) {
       const item = await userInventoryCollection.findOne({ _id: new ObjectId(inventoryItemId), userId });

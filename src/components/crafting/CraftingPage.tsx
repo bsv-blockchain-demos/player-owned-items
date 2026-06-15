@@ -28,11 +28,13 @@ interface MaterialItem {
   name: string;
   icon: string;
   tier: number;
-  quantity: number; // For material tokens
+  quantity: number;
   isMinted: boolean;
   tokenId?: string;
   transactionId?: string;
   isMaterialToken: boolean;
+  keyId?: string;
+  counterparty?: string;
 }
 
 export default function CraftingPage() {
@@ -86,11 +88,13 @@ export default function CraftingPage() {
               name: lootItem.name,
               icon: lootItem.icon,
               tier: item.tier || 1,
-              quantity: item.quantity || 1, // Material tokens have quantity, regular items are 1
+              quantity: item.quantity || 1,
               isMinted: item.isMinted || false,
               tokenId: item.tokenId,
               transactionId: item.transactionId,
-              isMaterialToken: item.isMaterialToken || false
+              isMaterialToken: item.isMaterialToken || false,
+              keyId: item.keyId,
+              counterparty: item.counterparty,
             });
 
             // Count materials by lootTableId for UI display
@@ -217,7 +221,7 @@ export default function CraftingPage() {
         const lootItem = getLootItemById(material.lootTableId);
         return {
           inventoryItemId: material.inventoryId,
-          nftLootId: material.materialTokenId, // Material tokens use materialTokenId
+          nftLootId: material.materialTokenId,
           tokenId: material.tokenId!,
           transactionId: material.transactionId!,
           name: material.name,
@@ -229,7 +233,9 @@ export default function CraftingPage() {
           quantityNeeded: recipe.requiredMaterials.find(r => r.lootTableId === material.lootTableId)?.quantity || 1,
           description: lootItem?.description,
           icon: lootItem?.icon,
-          tier: material.tier
+          tier: material.tier,
+          keyId: material.keyId,
+          counterparty: material.counterparty,
         };
       });
 

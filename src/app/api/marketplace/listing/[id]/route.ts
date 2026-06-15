@@ -28,7 +28,7 @@ export async function GET(
       return NextResponse.json({ error: 'Missing listing id' }, { status: 400 });
     }
 
-    const { marketplaceItemsCollection } = await connectToMongo();
+    const { marketplaceItemsCollection, marketplaceListingBeefsCollection } = await connectToMongo();
 
     const listing = await marketplaceItemsCollection.findOne({
       _id: new ObjectId(listingId),
@@ -49,11 +49,16 @@ export async function GET(
       );
     }
 
+    // Attach the listing tx BEEF so the seller can spend the orderLock on cancel
+    // without the overlay (client falls back to overlay if this is missing).
+    const beefDoc = await marketplaceListingBeefsCollection.findOne({ listingId });
+
     return NextResponse.json({
       success: true,
       listing: {
         ...listing,
         _id: listing._id?.toString(),
+        ordLockBeef: beefDoc?.beef,
       },
     });
   } catch (error) {
