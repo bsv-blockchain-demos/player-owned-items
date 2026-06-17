@@ -14,7 +14,8 @@ This project showcases **production-ready BSV blockchain integration** for gamin
 - **Material Tokens**: Quantity-based tokens with smart updates
 - **Hybrid Crafting**: Client material consumption with server-minted output
 - **Auth Outputs**: On-chain provable links between transactions
-- **OrderLock Integration**: P2P marketplace for trading items _(coming soon)_
+- **Per-Output Derived Keys**: Type-42 (BRC-42) keys with a per-output nonce + wallet-basket storage (no key reuse)
+- **OrderLock Marketplace**: P2P listing / buy / cancel for trading items
 
 **📖 [Read More: Why BSV & Transaction Flow Pattern](./TRANSACTION_FLOW_PATTERN.md)**
 
@@ -36,6 +37,18 @@ Client Request → Server Validates → Server Mints → Server Transfers → Da
 - ✅ Validates user ownership before minting
 - ✅ Handles complex SIGHASH scenarios
 - ✅ All mints provably originate from server
+
+### Per-Output Derived Keys & Wallet Baskets
+
+Every token output is locked to a unique, freshly-derived child key (type-42 / BRC-42) using a per-output **nonce**, instead of one reused key — improving privacy/linkability and key-exposure hygiene.
+
+- **Protocol**: `TOKEN_PROTOCOL = [2, 'monsterbattle token']` (security level 2, counterparty-bound). Helpers in `src/utils/tokenDerivation.ts`.
+- **Nonce storage (dual)**: written to the owner's **wallet basket** via `internalizeAction` (basket `monsterbattle.tokens`) for self-custody/recovery, **and** to a DB index (`tokenId → {keyId, counterparty}`) for O(1) hot-path lookup. The wallet basket is the source of truth; the DB index is a rebuildable cache (`reindexFromBasket`).
+- **Creator carries the BEEF**: whoever builds a transfer provides its BEEF (the server holds what it built; clients post base64 BEEF in the request body). The overlay is a fallback only (`fetchTokenSourceTx`). BEEFs cross the wire **base64**-encoded.
+- **Dual-path unlock**: the `OrdinalsP2PKH` template defaults to the legacy fixed scheme, so pre-migration tokens still spend; new outputs use the derived scheme.
+- **Marketplace**: OrderLock listings are backed up in the `marketplace_listing_beefs` collection so buy/cancel never depend on the overlay.
+
+See the design/plan in `docs/specs/2026-06-11-derived-key-basket-storage-*.md`.
 
 ### Three Minting Flows
 
