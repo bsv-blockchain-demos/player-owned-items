@@ -7,6 +7,7 @@ import { usePlayer } from '@/contexts/PlayerContext';
 import toast from 'react-hot-toast';
 import SellItemModal from './SellItemModal';
 import MarketplaceItemDetailsModal from './MarketplaceItemDetailsModal';
+import SoldProceedsModal from './SoldProceedsModal';
 import NavigationButtons from '@/components/navigation/NavigationButtons';
 
 interface MarketplaceItem {
@@ -39,6 +40,8 @@ export default function MarketplacePage() {
   const [loading, setLoading] = useState(true);
   const [items, setItems] = useState<MarketplaceItem[]>([]);
   const [showSellModal, setShowSellModal] = useState(false);
+  const [showInboxModal, setShowInboxModal] = useState(false);
+  const [unclaimedCount, setUnclaimedCount] = useState(0);
   const [selectedItem, setSelectedItem] = useState<MarketplaceItem | null>(null);
 
   // Filter states
@@ -86,6 +89,26 @@ export default function MarketplacePage() {
       setLoading(false);
     }
   }, [searchQuery, selectedType, selectedRarity, selectedTier, showMyListings, playerStats?.userId]);
+
+  // Load count of unclaimed sale proceeds for the Inbox badge
+  const loadUnclaimedCount = useCallback(async () => {
+    try {
+      const response = await fetch('/api/marketplace/my-sales');
+      const data = await response.json();
+      if (response.ok && data.success) {
+        const unclaimed = (data.sales as { payoutClaimed: boolean }[]).filter(
+          (s) => !s.payoutClaimed
+        ).length;
+        setUnclaimedCount(unclaimed);
+      }
+    } catch (error) {
+      console.error('Error loading sold-items count:', error);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadUnclaimedCount();
+  }, [loadUnclaimedCount]);
 
   // Debounced search effect
   useEffect(() => {
@@ -144,11 +167,26 @@ export default function MarketplacePage() {
           )}
         </div>
 
-        {/* Navigation Bar */}
-        <NavigationButtons
-          showBattle
-          showInventory
-        />
+        {/* Navigation Bar — nav buttons left, Inbox right */}
+        <div className="flex items-center justify-between gap-2">
+          <NavigationButtons
+            showBattle
+            showInventory
+          />
+          <button
+            onClick={() => setShowInboxModal(true)}
+            className="relative px-3 sm:px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg transition-colors shadow-lg cursor-pointer flex items-center justify-center gap-2 text-sm md:text-base"
+            title="Claim proceeds from sold items"
+          >
+            <span className="text-xl">📥</span>
+            <span className="hidden sm:inline">Inbox</span>
+            {unclaimedCount > 0 && (
+              <span className="absolute -top-2 -right-2 bg-red-600 text-white text-xs font-bold rounded-full min-w-[1.25rem] h-5 px-1 flex items-center justify-center">
+                {unclaimedCount}
+              </span>
+            )}
+          </button>
+        </div>
       </div>
 
       <div className="max-w-7xl mx-auto">
@@ -322,6 +360,17 @@ export default function MarketplacePage() {
           onClose={() => setShowSellModal(false)}
           onSuccess={() => {
             loadMarketplaceItems();
+          }}
+        />
+      )}
+
+      {/* Sold Items Inbox Modal */}
+      {showInboxModal && (
+        <SoldProceedsModal
+          wallet={userWallet}
+          onClose={() => setShowInboxModal(false)}
+          onClaimed={() => {
+            loadUnclaimedCount();
           }}
         />
       )}

@@ -325,6 +325,7 @@ export async function POST(request: NextRequest) {
           status: 'sold',
           soldAt: new Date(),
           soldTo: userId,
+          payoutOutpoint: `${txid}.1`, // output 1 = seller payment (claimable proceeds)
         }
       }
     );

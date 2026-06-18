@@ -485,6 +485,10 @@ export interface MarketplaceItem {
   soldTo?: string;            // Buyer's userId
   cancelledAt?: Date;
 
+  // Sale proceeds (sold listings)
+  payoutOutpoint?: string;    // Outpoint of the seller-payment output (txid.1) — internalize to claim proceeds
+  payoutClaimed?: boolean;    // True once the seller has internalized the payout output
+
   // Additional metadata (for equipment items)
   equipmentStats?: EquipmentStats;  // Base stats from loot table
   crafted?: boolean;          // True if item was crafted
