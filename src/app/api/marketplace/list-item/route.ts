@@ -27,7 +27,7 @@ export async function POST(request: NextRequest) {
     const userId = payload.userId as string;
 
     const body = await request.json();
-    const { inventoryItemId, materialTokenId, price, userPublicKey, ordLockOutpoint, ordLockScript, ordLockBeef } = body;
+    const { inventoryItemId, materialTokenId, price, userPublicKey, listingNonce, ordLockOutpoint, ordLockScript, ordLockBeef } = body;
 
     // Validate price
     if (!price || isNaN(price) || price <= 0) {
@@ -298,6 +298,7 @@ export async function POST(request: NextRequest) {
       ordLockScript: ordLockScript,
       payAddress: payAddress,
       assetId: assetId,
+      listingNonce: listingNonce, // nonce to re-derive the per-listing cancel/payout key
       status: 'active' as const,
       listedAt: new Date(),
     };

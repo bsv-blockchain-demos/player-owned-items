@@ -476,6 +476,7 @@ export interface MarketplaceItem {
   ordLockScript?: string;     // Full orderLock script hex (for validation)
   payAddress?: string;        // Address that receives payment (seller's address)
   assetId?: string;           // Asset ID used in OrdLock (txid_vout format)
+  listingNonce?: string;      // Per-listing nonce to re-derive the orderlock cancel/payout key (absent = legacy static-key listing)
 
   // Status
   status: 'active' | 'sold' | 'cancelled';

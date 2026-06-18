@@ -1281,5 +1281,49 @@ describe('OrdLock - Marketplace Transaction Validation', () => {
       await purchaseTx.sign();
       expect(await purchaseTx.verify('scripts only')).toBe(true);
     }, 60000);
+
+    it('cancels a listing whose ordAddress is a per-listing derived key (no static key)', async () => {
+      const serverWallet = await makeWallet('main', storageURL, new PrivateKey(210).toHex());
+      const sellerWallet = await makeWallet('main', storageURL, new PrivateKey(211).toHex());
+      const { publicKey: serverIdentityKey } = await serverWallet.getPublicKey({ identityKey: true });
+      const { publicKey: sellerIdentityKey } = await sellerWallet.getPublicKey({ identityKey: true });
+
+      const assetId = 'derived_cancel_txid_0';
+      const itemData = { name: 'Derived Blade', type: 'weapon', rarity: 'legendary' };
+
+      // Per-listing nonce: ordAddress (+ payAddress) is the seller's derived key, NOT the static [0]/'0' key.
+      const listingNonce = generateNonce();
+      const listingKey = await deriveOwnKey(sellerWallet, serverIdentityKey, listingNonce);
+      const listingAddress = PublicKey.fromString(listingKey).toAddress();
+
+      // Mint a derived NFT to the seller.
+      const mintNonce = generateNonce();
+      const sellerNftKey = await deriveRecipientKey(serverWallet, sellerIdentityKey, mintNonce);
+      const nftTx = new Transaction();
+      nftTx.addInput({ sourceTXID: '00'.repeat(32), sourceOutputIndex: 0, unlockingScript: Script.fromASM('OP_TRUE') });
+      nftTx.addOutput({ lockingScript: new OrdinalsP2PKH().lock(sellerNftKey, assetId, itemData, 'transfer'), satoshis: 1 });
+      nftTx.merklePath = MerklePath.fromCoinbaseTxidAndHeight(nftTx.id('hex'), 9100);
+
+      // List into an orderLock locked to the DERIVED listing key.
+      const orderLock = new OrdLock(sellerWallet);
+      const listScript = await orderLock.lock({ ordAddress: listingAddress, payAddress: listingAddress, price: 4000, assetId, itemData, metadata: { app: 'monsterbattle', type: 'ord' } });
+      const listTx = new Transaction();
+      listTx.addInput({ sourceTransaction: nftTx, sourceOutputIndex: 0, unlockingScriptTemplate: new OrdinalsP2PKH().unlock(sellerWallet, 'single', true, undefined, undefined, { protocolID: TOKEN_PROTOCOL, keyID: mintNonce, counterparty: serverIdentityKey }) });
+      listTx.addOutput({ lockingScript: listScript, satoshis: 1 });
+      await listTx.fee();
+      await listTx.sign();
+      expect(await listTx.verify('scripts only')).toBe(true);
+      listTx.merklePath = MerklePath.fromCoinbaseTxidAndHeight(listTx.id('hex'), 9101);
+
+      // Cancel: sign with the SAME per-listing nonce derivation (proves a derived cancel validates).
+      const reclaimNonce = generateNonce();
+      const reclaimKey = await deriveOwnKey(sellerWallet, serverIdentityKey, reclaimNonce);
+      const cancelTx = new Transaction();
+      cancelTx.addInput({ sourceTransaction: listTx, sourceOutputIndex: 0, unlockingScriptTemplate: orderLock.cancelUnlock({ protocolID: TOKEN_PROTOCOL, keyID: listingNonce, counterparty: serverIdentityKey }) });
+      cancelTx.addOutput({ lockingScript: new OrdinalsP2PKH().lock(reclaimKey, assetId, itemData, 'transfer'), satoshis: 1 });
+      await cancelTx.fee();
+      await cancelTx.sign();
+      expect(await cancelTx.verify('scripts only')).toBe(true);
+    }, 60000);
   });
 });

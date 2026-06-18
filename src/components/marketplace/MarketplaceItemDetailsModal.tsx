@@ -7,7 +7,7 @@ import toast from 'react-hot-toast';
 import { WalletOrdLock } from '@bsv/wallet-helper';
 import { OrdinalsP2PKH } from '@/utils/ordinalP2PKH';
 import { broadcastTX, getTransactionByTxID } from '@/utils/overlayFunctions';
-import { generateNonce, deriveOwnKey } from '@/utils/tokenDerivation';
+import { generateNonce, deriveOwnKey, TOKEN_PROTOCOL } from '@/utils/tokenDerivation';
 import { encodeBeef, decodeBeef } from '@/utils/beefEncoding';
 import { internalizeToBasket } from '@/utils/internalizeToBasket';
 
@@ -90,11 +90,10 @@ export default function MarketplaceItemDetailsModal({
         throw new Error('Wallet not authenticated');
       }
 
-      // Get user's public key
-      const { publicKey } = await wallet.getPublicKey({
-        protocolID: [0, "monsterbattle"],
-        keyID: "0",
-      });
+      // Server identity key is the derivation counterparty for both the per-listing
+      // cancel key and the self-key the reclaimed token is re-locked to.
+      const serverIdentityKeyRes = await fetch('/api/server-identity-key');
+      const { publicKey: serverIdentityKey } = await serverIdentityKeyRes.json();
 
       const listingRes = await fetch(`/api/marketplace/listing/${item._id}`);
       const listingData = await listingRes.json();
@@ -124,10 +123,12 @@ export default function MarketplaceItemDetailsModal({
 
       const ordLock = new WalletOrdLock(wallet);
       const ordLockScript = Script.fromHex(listing.ordLockScript);
+      // Per-listing derived key: sign cancel with the listingNonce/server-identity derivation
+      // that locked this orderlock
       const cancelUnlockTemplate = ordLock.cancelUnlock({
-        protocolID: [0, "monsterbattle"],
-        keyID: "0",
-        counterparty: "self",
+        ...(listing.listingNonce
+          ? { protocolID: TOKEN_PROTOCOL, keyID: listing.listingNonce, counterparty: serverIdentityKey }
+          : { protocolID: [0, "monsterbattle"], keyID: "0", counterparty: "self" }),
         signOutputs: 'all',
         anyoneCanPay: false,
         sourceSatoshis: 1,
@@ -138,8 +139,6 @@ export default function MarketplaceItemDetailsModal({
       const ordinalP2PKH = new OrdinalsP2PKH();
 
       // Derive a self-key so the reclaimed token is keyed like any received token
-      const serverIdentityKeyRes = await fetch('/api/server-identity-key');
-      const { publicKey: serverIdentityKey } = await serverIdentityKeyRes.json();
       const cancelNonce = generateNonce();
       const returnKey = await deriveOwnKey(wallet, serverIdentityKey, cancelNonce);
 
@@ -269,7 +268,6 @@ export default function MarketplaceItemDetailsModal({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           listingId: item._id,
-          userPublicKey: publicKey,
           returnTokenId,
           cancelBeef: encodeBeef(Array.from(signed.tx!)), // server validates from this (no overlay race)
           keyId: cancelNonce,

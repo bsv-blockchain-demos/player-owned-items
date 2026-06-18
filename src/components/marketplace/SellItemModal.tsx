@@ -8,7 +8,7 @@ import { usePlayer } from '@/contexts/PlayerContext';
 import toast from 'react-hot-toast';
 import { broadcastTX } from '@/utils/overlayFunctions';
 import { fetchTokenSourceTx } from '@/utils/fetchTokenSourceTx';
-import { TOKEN_PROTOCOL } from '@/utils/tokenDerivation';
+import { TOKEN_PROTOCOL, generateNonce, deriveOwnKey } from '@/utils/tokenDerivation';
 import { encodeBeef } from '@/utils/beefEncoding';
 
 interface SellItemModalProps {
@@ -157,11 +157,10 @@ export default function SellItemModal({ wallet, onClose, onSuccess }: SellItemMo
         throw new Error('Wallet not authenticated');
       }
 
-      // Get user's public key
-      const { publicKey: userPublicKey } = await wallet.getPublicKey({
-        protocolID: [0, "monsterbattle"],
-        keyID: "0",
-      });
+      // Derive a per-listing key so the orderlock cancel/payout address is unique
+      const { publicKey: serverIdentityKey } = await (await fetch('/api/server-identity-key')).json();
+      const listingNonce = generateNonce();
+      const listingKey = await deriveOwnKey(wallet, serverIdentityKey, listingNonce);
 
       if (!selectedItem.tokenId) {
         throw new Error('Item missing tokenId');
@@ -181,7 +180,7 @@ export default function SellItemModal({ wallet, onClose, onSuccess }: SellItemMo
       const tokenTransaction = await fetchTokenSourceTx(wallet, selectedItem.tokenId);
       const tokenBeef = tokenTransaction.toBEEF();
 
-      const payAddress = PublicKey.fromString(userPublicKey).toAddress();
+      const payAddress = PublicKey.fromString(listingKey).toAddress();
       const cancelAddress = payAddress;
       const assetId = selectedItem.mintOutpoint.replace('.', '_');
 
@@ -307,7 +306,8 @@ export default function SellItemModal({ wallet, onClose, onSuccess }: SellItemMo
           inventoryItemId: selectedItem.isMaterialToken ? undefined : selectedItem.id,
           materialTokenId: selectedItem.isMaterialToken ? selectedItem.id : undefined,
           price: priceNum,
-          userPublicKey,
+          userPublicKey: listingKey, // per-listing derived key (orderlock cancel/payout address)
+          listingNonce,              // nonce to re-derive the listing key at cancel time
           ordLockOutpoint,
           ordLockScript: ordLockScript.toHex(),
           ordLockBeef: encodeBeef(Array.from(action.tx!)), // server validates from this (no overlay race)
