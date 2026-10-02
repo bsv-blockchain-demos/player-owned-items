@@ -119,15 +119,20 @@ import StatRangeIndicator from '@/components/crafting/StatRangeIndicator';
 
 ---
 
-## Badge Standard Sizes
+## Sizing and stacking
 
-- **small**: For item thumbnails/cards (inventory, loot selection)
-- **medium**: Standard size (default)
-- **large**: For modals and detail views
+Only `EmpoweredBadge` accepts `size="small"`, `"medium"` or `"large"`. The other badges use fixed styling and accept `className` for additional classes.
 
-## Badge z-index Hierarchy
+For corner positions, put the badge inside a relatively positioned parent. `inline` removes absolute positioning and the component's positional z-index classes.
 
-All badges use `z-20` for absolute positioning to ensure they appear above item content but below modals.
+| Component | Positional stacking class |
+| --- | --- |
+| `EmpoweredBadge` | `z-50` |
+| `TierBadge` | `z-20` |
+| `CountBadge` | `z-20` |
+| `MintingStatusBadge` | `z-10` |
+
+`MintingStatusBadge` currently combines `left-1` with `sm:right-2` in its `top-left` variant. Use the demonstrated `top-right` position or inspect its responsive placement before relying on `top-left`.
 
 ---
 
