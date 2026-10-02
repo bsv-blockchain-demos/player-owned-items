@@ -6,5 +6,6 @@
   "dependencies": {
     "@bsv/sdk": "^2.0.13",
     "@bsv/auth": "^0.0.1"
-  }
+  },
+  "license": "SEE LICENSE IN LICENSE.txt"
 }

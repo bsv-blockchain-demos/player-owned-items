@@ -18,5 +18,6 @@
   "scripts": {
     "dev": "tsx watch index.ts",
     "start": "tsx index.ts"
-  }
+  },
+  "license": "SEE LICENSE IN LICENSE.txt"
 }
