@@ -2,7 +2,8 @@
 // from here; never read process.env elsewhere in server/. SERVER-ONLY —
 // never import this from client/ (it would bundle secrets into the browser build).
 import dotenv from 'dotenv';
-dotenv.config({ path: 'server/.env' }); // dev: load server/.env; prod: host env already set (dotenv no-ops on missing file)
+import path from 'node:path';
+dotenv.config({ path: path.join(__dirname, '.env') }); // dev: load server/.env; prod: host env already set (dotenv no-ops on missing file)
 
 function required(name: string): string {
   const value = process.env[name];
