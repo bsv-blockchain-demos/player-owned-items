@@ -33,8 +33,9 @@ export async function claimMaterialUnits(
       userId,
       lootTableId,
       tier,
-      nftLootId: { $exists: false },
-      tokenId: { $exists: false },
+      // Unminted = missing OR null; select-loot's `nftLootId: undefined` is stored as null.
+      nftLootId: { $not: { $type: 'objectId' } },
+      tokenId: { $not: { $type: 'string' } },
       mintClaim: { $exists: false },
     },
     { $set: { mintClaim: claimId } },

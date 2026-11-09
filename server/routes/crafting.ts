@@ -89,7 +89,7 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
   );
   if (
     !wellFormed ||
-    new Set(entries.map((m) => m.materialTokenId)).size !== entries.length ||
+    new Set(entries.map((m) => (m.materialTokenId as string).toLowerCase())).size !== entries.length ||
     new Set(entries.map((m) => m.tokenId)).size !== entries.length
   ) {
     res.status(400).json({ error: 'Invalid transferredMaterials' });

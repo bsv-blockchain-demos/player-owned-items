@@ -233,6 +233,7 @@ describe('POST /api/crafting/mint-and-transfer', () => {
 
   it.each([
     ['the same material token twice', [validBody.transferredMaterials[0], validBody.transferredMaterials[1], { ...validBody.transferredMaterials[0], tokenId: 'BATCHTX.2' }]],
+    ['the same material token twice in different case', [validBody.transferredMaterials[0], validBody.transferredMaterials[1], { ...validBody.transferredMaterials[0], tokenId: 'BATCHTX.2', materialTokenId: WOOD.toUpperCase() }]],
     ['the same batch outpoint twice', [validBody.transferredMaterials[0], { ...validBody.transferredMaterials[1], tokenId: 'BATCHTX.0' }]],
     ['a malformed materialTokenId', [validBody.transferredMaterials[0], { ...validBody.transferredMaterials[1], materialTokenId: { $ne: null } }]],
     ['a non-string tokenId', [validBody.transferredMaterials[0], { ...validBody.transferredMaterials[1], tokenId: 7 }]],
