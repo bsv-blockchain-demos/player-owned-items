@@ -4,7 +4,8 @@ jest.mock('@server/middleware/requireAuthProof', () => ({
 }));
 
 const enqueue = jest.fn((_label: string, fn: (w: any) => Promise<any>) => fn(stubWallet));
-jest.mock('@server/lib/walletQueue', () => ({ getWalletQueue: jest.fn(async () => ({ enqueue })) }));
+const getWalletQueue = jest.fn(async () => ({ enqueue }));
+jest.mock('@server/lib/walletQueue', () => ({ getWalletQueue: () => getWalletQueue() }));
 
 const nftInsertOne = jest.fn(async () => ({ insertedId: 'NFT_OID' }));
 const inventoryInsertOne = jest.fn(async () => ({ insertedId: 'INV_OID' }));
@@ -19,6 +20,7 @@ const materialFindOne = jest.fn(async (q: { _id: { toHexString(): string }; user
   const t = ownedTokens[q._id.toHexString()];
   return t && q.userId === 'u1' && t.lootTableId === q.lootTableId ? { _id: q._id, ...t } : null;
 });
+const listingFindOne = jest.fn(async (_filter: any): Promise<unknown> => null);
 let playerLevel = 1;
 const playerStatsFindOne = jest.fn(async () => ({ userId: 'u1', level: playerLevel }));
 jest.mock('@server/lib/mongodb', () => ({
@@ -32,6 +34,7 @@ jest.mock('@server/lib/mongodb', () => ({
       updateMany: materialUpdateMany,
     },
     playerStatsCollection: { findOne: playerStatsFindOne },
+    marketplaceItemsCollection: { findOne: listingFindOne },
   })),
 }));
 
@@ -127,15 +130,33 @@ const defaultBatchInputs = [
   { sourceTXID: 'LEATHERTX', sourceOutputIndex: 0 },
 ];
 
+/** Locking script whose chunks carry a bsv-20 transfer inscription, as OrdinalsP2PKH lays them out. */
+const bytes = (text: string) => [...Buffer.from(text, 'utf8')];
+const inscribed = (hex: string, amt: number) => ({
+  toHex: () => hex,
+  chunks: [
+    { op: 0 }, { op: 0x63 }, { op: 3, data: bytes('ord') }, { op: 0x51 },
+    { op: 18, data: bytes('application/bsv-20') }, { op: 0 },
+    { op: 1, data: bytes(JSON.stringify({ p: 'bsv-20', op: 'transfer', amt, id: 'ANY_0' })) },
+  ],
+});
+
 /** payment tx + batch-transfer tx — reached by every request past field validation. */
-function seedPaymentAndBatchMocks(scriptHexes: string[], inputs = defaultBatchInputs) {
+function seedPaymentAndBatchMocks(scriptHexes: string[], inputs = defaultBatchInputs, amts = [7, 2]) {
   (Transaction.fromBEEF as jest.Mock)
     .mockReturnValueOnce({ id: () => 'PAYTXID', outputs: [{ satoshis: 100 }] })
     .mockReturnValueOnce({
+      id: () => 'BATCHTX',
       inputs,
-      outputs: scriptHexes.map((hex) => ({ lockingScript: { toHex: () => hex } })),
+      outputs: scriptHexes.map((hex, i) => ({ lockingScript: inscribed(hex, amts[i]) })),
       toBEEF: () => [1, 1],
     });
+}
+
+/** Nothing was claimed or sent to the wallet. */
+function expectNotClaimed() {
+  expect(materialUpdateMany).not.toHaveBeenCalled();
+  expect(enqueue).not.toHaveBeenCalled();
 }
 
 /** The two dependent wallet actions inside the queue (mint crafted item, then transfer). */
@@ -181,6 +202,8 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     materialUpdateOne.mockResolvedValue({ modifiedCount: 1 });
     materialUpdateMany.mockImplementation(async (filter: any) => ({ modifiedCount: filter.$or?.length ?? 0 }));
     enqueue.mockImplementation((_label: string, fn: (w: any) => Promise<any>) => fn(stubWallet));
+    getWalletQueue.mockImplementation(async () => ({ enqueue }));
+    listingFindOne.mockResolvedValue(null);
     stubWallet.getPublicKey.mockResolvedValue({ publicKey: 'PK' });
     nonceQueue = [];
     ownedTokens = defaultOwnedTokens();
@@ -193,42 +216,42 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     const res = await post({ ...validBody, transferredMaterials: [] });
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Missing or invalid transferredMaterials' });
-    expect(enqueue).not.toHaveBeenCalled();
+    expectNotClaimed();
   });
 
   it('400 on missing userIdentityKey', async () => {
     const res = await post({ ...validBody, userIdentityKey: undefined });
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Missing required fields' });
-    expect(enqueue).not.toHaveBeenCalled();
+    expectNotClaimed();
   });
 
   it('400 on missing paymentTx', async () => {
     const res = await post({ ...validBody, paymentTx: undefined });
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Missing payment transaction' });
-    expect(enqueue).not.toHaveBeenCalled();
+    expectNotClaimed();
   });
 
   it('400 on missing batchTransferBeef', async () => {
     const res = await post({ ...validBody, batchTransferBeef: undefined });
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Missing batch transfer BEEF' });
-    expect(enqueue).not.toHaveBeenCalled();
+    expectNotClaimed();
   });
 
   it('400 on missing walletParams', async () => {
     const res = await post({ ...validBody, walletParams: undefined });
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Missing wallet derivation parameters' });
-    expect(enqueue).not.toHaveBeenCalled();
+    expectNotClaimed();
   });
 
   it('400 on an unknown recipeId', async () => {
     const res = await post({ ...validBody, recipeId: 'craft_free_excalibur' });
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Unknown recipe: craft_free_excalibur' });
-    expect(enqueue).not.toHaveBeenCalled();
+    expectNotClaimed();
   });
 
   it.each([
@@ -241,14 +264,14 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     const res = await post({ ...validBody, transferredMaterials });
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Invalid transferredMaterials' });
-    expect(enqueue).not.toHaveBeenCalled();
+    expectNotClaimed();
   });
 
   it('400 when a required material is missing from the transfer', async () => {
     const res = await post({ ...validBody, transferredMaterials: [validBody.transferredMaterials[0]] });
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Transferred materials do not match recipe craft_wooden_sword' });
-    expect(enqueue).not.toHaveBeenCalled();
+    expectNotClaimed();
   });
 
   it('400 when a material outside the recipe is transferred', async () => {
@@ -258,7 +281,7 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     });
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Transferred materials do not match recipe craft_wooden_sword' });
-    expect(enqueue).not.toHaveBeenCalled();
+    expectNotClaimed();
   });
 
   it('403 when the player is below the recipe unlock level', async () => {
@@ -274,7 +297,7 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     });
     expect(res.status).toBe(403);
     expect(res.body).toEqual({ error: 'Recipe craft_iron_sword requires level 3' });
-    expect(enqueue).not.toHaveBeenCalled();
+    expectNotClaimed();
   });
 
   it('400 when the user does not own the named material token', async () => {
@@ -282,7 +305,7 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     const res = await post(validBody);
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Material common_leather not owned' });
-    expect(enqueue).not.toHaveBeenCalled();
+    expectNotClaimed();
   });
 
   it('400 when the owned quantity is below the recipe requirement (client quantity ignored)', async () => {
@@ -290,7 +313,7 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     const res = await post(validBody);
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Insufficient common_leather: need 2, have 1' });
-    expect(enqueue).not.toHaveBeenCalled();
+    expectNotClaimed();
   });
 
   it('404 when a transferred material output is not found (rejects before enqueue)', async () => {
@@ -298,7 +321,7 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     const res = await post(validBody);
     expect(res.status).toBe(404);
     expect(res.body).toEqual({ error: 'Transfer output not found: BATCHTX.1' });
-    expect(enqueue).not.toHaveBeenCalled();
+    expectNotClaimed();
   });
 
   it('400 when a transferred material is not locked to the server derived key (rejects before enqueue)', async () => {
@@ -306,7 +329,7 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     const res = await post(validBody);
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Material common_leather not locked to server derived key' });
-    expect(enqueue).not.toHaveBeenCalled();
+    expectNotClaimed();
   });
 
   it('400 when the batch transfer does not spend the owned material token', async () => {
@@ -317,7 +340,76 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     const res = await post(validBody);
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Material common_leather transfer does not spend owned token' });
-    expect(enqueue).not.toHaveBeenCalled();
+    expectNotClaimed();
+  });
+
+  it.each([
+    ['a foreign txid', 'OTHERTX.1'],
+    ['a non-canonical vout', 'BATCHTX.01'],
+  ])('400 when a transfer outpoint names %s', async (_label, tokenId) => {
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1']);
+    const res = await post({
+      ...validBody,
+      transferredMaterials: [validBody.transferredMaterials[0], { ...validBody.transferredMaterials[1], tokenId }],
+    });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: `Transfer outpoint not in batch transfer: ${tokenId}` });
+    expectNotClaimed();
+  });
+
+  it('400 when a transfer output does not carry the whole owned token (on-chain split)', async () => {
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1'], defaultBatchInputs, [7, 1]);
+    const res = await post(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Material common_leather transfer must carry the full token quantity (2)' });
+    expectNotClaimed();
+  });
+
+  it('409 when a material token is listed on the marketplace', async () => {
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1']);
+    listingFindOne.mockResolvedValueOnce({ _id: 'LISTING', materialTokenId: LEATHER, status: 'pending' });
+
+    const res = await post(validBody);
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'Material token is listed on the marketplace' });
+    expect(listingFindOne).toHaveBeenCalledWith({
+      materialTokenId: { $in: [WOOD, LEATHER] },
+      status: { $in: ['active', 'pending'] },
+    });
+    expectNotClaimed();
+  });
+
+  it('claims nothing when the wallet queue cannot be obtained', async () => {
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1']);
+    getWalletQueue.mockRejectedValueOnce(new Error('queue down'));
+
+    const res = await post(validBody);
+
+    expect(res.status).toBe(500);
+    expectNotClaimed();
+  });
+
+  it('still returns the BEEF when a DB write fails after the wallet succeeded, keeping the claim', async () => {
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1']);
+    seedEnqueueMocks();
+    nftInsertOne.mockRejectedValueOnce(new Error('db down'));
+
+    const res = await post(validBody);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(expect.objectContaining({
+      success: true,
+      dbRecorded: false,
+      tokenId: 'TRANSFERTX.0',
+      transferBeef: 'BEEF_B64',
+      received: [
+        { outputIndex: 0, keyId: 'N_ITEM', counterparty: 'SERVER_ID', tags: ['type:item'] },
+        { outputIndex: 1, keyId: 'N_CHANGE', counterparty: 'SERVER_ID', tags: ['type:material'] },
+      ],
+    }));
+    // Claim held: the tokens are spent on chain, so they must not become usable again.
+    expect(materialUpdateMany).toHaveBeenCalledTimes(1);
   });
 
   it('409 and releases the claim when a material token is already in use by another request', async () => {
@@ -353,6 +445,7 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
       success: true,
+      dbRecorded: true,
       nftId: 'NFT_OID',
       tokenId: 'TRANSFERTX.0',
       transferTransactionId: 'TRANSFERTX',
@@ -422,12 +515,19 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     );
     // Token write-backs target the exact claimed doc.
     expect(materialDeleteOne).toHaveBeenCalledTimes(1);
-    expect(materialDeleteOne).toHaveBeenCalledWith({ _id: new ObjectId(LEATHER), pendingClaim: tokenClaimId() });
+    expect(materialDeleteOne).toHaveBeenCalledWith({ _id: new ObjectId(LEATHER), userId: 'u1', tokenId: 'LEATHERTX.0', pendingClaim: tokenClaimId() });
     expect(materialUpdateOne).toHaveBeenCalledTimes(1);
     expect(materialUpdateOne).toHaveBeenCalledWith(
-      { _id: new ObjectId(WOOD), pendingClaim: tokenClaimId() },
+      { _id: new ObjectId(WOOD), userId: 'u1', tokenId: 'WOODTX.0', pendingClaim: tokenClaimId() },
       expect.objectContaining({
-        $set: expect.objectContaining({ tokenId: 'TRANSFERTX.1', quantity: 2, keyId: 'N_CHANGE', counterparty: 'SERVER_ID' }),
+        $set: expect.objectContaining({
+          tokenId: 'TRANSFERTX.1',
+          quantity: 2,
+          keyId: 'N_CHANGE',
+          counterparty: 'SERVER_ID',
+          previousTokenId: 'WOODTX.0',
+          lastTransactionId: 'TRANSFERTX',
+        }),
         $unset: { pendingClaim: '' },
         $push: expect.objectContaining({
           updateHistory: expect.objectContaining({
@@ -465,7 +565,7 @@ describe('POST /api/crafting/mint-and-transfer', () => {
       { sourceTXID: 'WOODTX', sourceOutputIndex: 0 },
       { sourceTXID: 'WOODT3TX', sourceOutputIndex: 0 },
       { sourceTXID: 'LEATHERTX', sourceOutputIndex: 0 },
-    ]);
+    ], [3, 4, 2]);
     seedEnqueueMocks(3);
 
     const res = await post(body);
@@ -481,11 +581,11 @@ describe('POST /api/crafting/mint-and-transfer', () => {
       2,
     );
     const claim = tokenClaimId();
-    expect(materialDeleteOne).toHaveBeenCalledWith({ _id: new ObjectId(WOOD), pendingClaim: claim });
-    expect(materialDeleteOne).toHaveBeenCalledWith({ _id: new ObjectId(LEATHER), pendingClaim: claim });
+    expect(materialDeleteOne).toHaveBeenCalledWith({ _id: new ObjectId(WOOD), userId: 'u1', tokenId: 'WOODTX.0', pendingClaim: claim });
+    expect(materialDeleteOne).toHaveBeenCalledWith({ _id: new ObjectId(LEATHER), userId: 'u1', tokenId: 'LEATHERTX.0', pendingClaim: claim });
     expect(materialUpdateOne).toHaveBeenCalledTimes(1);
     expect(materialUpdateOne).toHaveBeenCalledWith(
-      { _id: new ObjectId(WOOD_T3), pendingClaim: claim },
+      { _id: new ObjectId(WOOD_T3), userId: 'u1', tokenId: 'WOODT3TX.0', pendingClaim: claim },
       expect.objectContaining({ $set: expect.objectContaining({ tokenId: 'TRANSFERTX.1', quantity: 2 }) }),
     );
   });

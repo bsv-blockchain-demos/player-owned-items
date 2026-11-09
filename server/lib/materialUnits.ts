@@ -3,7 +3,7 @@
 // mints can't count the same units twice. Material tokens are claimed the same
 // way before any wallet action spends them.
 import { ObjectId, type Collection } from 'mongodb';
-import type { UserInventory, MaterialToken } from '@shared/types';
+import type { UserInventory, MaterialToken, MarketplaceItem } from '@shared/types';
 import type { Tier } from '@shared/biome-config';
 
 /** Distinct, well-formed ObjectIds, or null. */
@@ -77,4 +77,34 @@ export async function claimMaterialTokens(
 
 export async function releaseMaterialTokens(col: Collection<MaterialToken>, claimId: string): Promise<void> {
   await col.updateMany({ pendingClaim: claimId }, { $unset: { pendingClaim: '' } });
+}
+
+export const TOKEN_LISTED = 'Material token is listed on the marketplace';
+
+/** True if any of the tokens has a live (active or mid-purchase) marketplace listing. */
+export async function anyTokenListed(col: Collection<MarketplaceItem>, ids: ObjectId[]): Promise<boolean> {
+  const listing = await col.findOne({
+    materialTokenId: { $in: ids.map((id) => id.toHexString()) },
+    status: { $in: ['active', 'pending'] },
+  });
+  return listing !== null;
+}
+
+/** The vout of `outpoint` if it is exactly `${txid}.${canonical vout}`, else null. */
+export function voutOf(outpoint: string, txid: string): number | null {
+  const [id, vout, ...rest] = outpoint.split('.');
+  if (rest.length || id !== txid || !/^(0|[1-9]\d*)$/.test(vout ?? '')) return null;
+  return Number(vout);
+}
+
+/** The amount of an OrdinalsP2PKH bsv-20 transfer inscription, or null if the script carries none. */
+export function transferAmount(script: { chunks: Array<{ data?: number[] }> }): number | null {
+  const [, , marker, , , , body] = script.chunks;
+  if (!marker?.data || !body?.data || Buffer.from(marker.data).toString('utf8') !== 'ord') return null;
+  try {
+    const inscription = JSON.parse(Buffer.from(body.data).toString('utf8'));
+    return inscription?.op === 'transfer' && Number.isInteger(inscription.amt) ? inscription.amt : null;
+  } catch {
+    return null;
+  }
 }

@@ -4,7 +4,8 @@ jest.mock('@server/middleware/requireAuthProof', () => ({
 }));
 
 const enqueue = jest.fn((_label: string, fn: (w: any) => Promise<any>) => fn(stubWallet));
-jest.mock('@server/lib/walletQueue', () => ({ getWalletQueue: jest.fn(async () => ({ enqueue })) }));
+const getWalletQueue = jest.fn(async () => ({ enqueue }));
+jest.mock('@server/lib/walletQueue', () => ({ getWalletQueue: () => getWalletQueue() }));
 
 const findOne = jest.fn();
 const updateOne = jest.fn(async () => ({ modifiedCount: 1 }));
@@ -13,10 +14,12 @@ const updateMany = jest.fn(async (_filter: any, _update: any) => ({ modifiedCoun
 const deleteMany = jest.fn(async (_filter: any) => ({ deletedCount: 1 }));
 // The existing material token is claimed (pendingClaim) before the wallet queue.
 const tokenUpdateMany = jest.fn(async (_filter: any, _update: any) => ({ modifiedCount: 1 }));
+const listingFindOne = jest.fn(async (_filter: any): Promise<unknown> => null);
 jest.mock('@server/lib/mongodb', () => ({
   connectToMongo: jest.fn(async () => ({
     materialTokensCollection: { findOne, updateOne, updateMany: tokenUpdateMany },
     userInventoryCollection: { updateMany, deleteMany },
+    marketplaceItemsCollection: { findOne: listingFindOne },
   })),
 }));
 
@@ -57,6 +60,7 @@ jest.mock('@bsv/sdk', () => ({
 }));
 
 import request from 'supertest';
+import { ObjectId } from 'mongodb';
 import { buildApp } from '@server/app';
 import { Transaction } from '@bsv/sdk';
 import { broadcastTX } from '@shared/overlayFunctions';
@@ -88,21 +92,39 @@ const validBody = {
   inventoryItemIds: ['507f1f77bcf86cd799439011'],
 };
 
-const ownedToken = { _id: 'EXISTING_OID', quantity: 5, tokenId: 'USERTOKEN.0' };
+const EXISTING_OID = new ObjectId('64b0000000000000000000aa');
+const ownedToken = { _id: EXISTING_OID, quantity: 5, tokenId: 'USERTOKEN.0' };
 
-/** payment tx + transfer tx — reached by every request past field validation + token lookup. */
+/** Locking script whose chunks carry a bsv-20 transfer inscription, as OrdinalsP2PKH lays them out. */
+const bytes = (text: string) => [...Buffer.from(text, 'utf8')];
+const inscribed = (hex: string, amt: number) => ({
+  toHex: () => hex,
+  chunks: [
+    { op: 0 }, { op: 0x63 }, { op: 3, data: bytes('ord') }, { op: 0x51 },
+    { op: 18, data: bytes('application/bsv-20') }, { op: 0 },
+    { op: 1, data: bytes(JSON.stringify({ p: 'bsv-20', op: 'transfer', amt, id: 'USERTOKEN_0' })) },
+  ],
+});
+
+/** payment tx + transfer tx — reached by every request past field validation. */
 function seedPaymentAndTransferMocks(
   transferScriptHex: string,
   inputs = [{ sourceTXID: 'USERTOKEN', sourceOutputIndex: 0 }],
+  amt = 5,
 ) {
   (Transaction.fromBEEF as jest.Mock)
     .mockReturnValueOnce({ id: () => 'PAYTXID', outputs: [{ satoshis: 100 }] })
     .mockReturnValueOnce({
+      id: () => 'TXID1',
       inputs,
-      outputs: [{ lockingScript: { toHex: () => transferScriptHex } }],
+      outputs: [{ lockingScript: inscribed(transferScriptHex, amt) }],
       toBEEF: () => [1, 1],
     });
 }
+
+/** The owned token is found only by the outpoint the transfer spends. */
+const findBySpentOutpoint = async (q: { tokenId?: { $in?: string[] } }) =>
+  q.tokenId?.$in?.includes(ownedToken.tokenId) ? ownedToken : null;
 
 /** The claim id the route stamped on the inventory units (first updateMany call). */
 const claimId = () => updateMany.mock.calls[0][1].$set.mintClaim as string;
@@ -144,6 +166,9 @@ describe('POST /api/materials/add-and-merge', () => {
     (Transaction as any).fromBEEF = jest.fn();
     (Transaction as any).fromAtomicBEEF = jest.fn(() => ({}));
     findOne.mockReset();
+    findOne.mockImplementation(findBySpentOutpoint);
+    getWalletQueue.mockImplementation(async () => ({ enqueue }));
+    listingFindOne.mockResolvedValue(null);
     updateOne.mockResolvedValue({ modifiedCount: 1 });
     updateMany.mockResolvedValue({ modifiedCount: 1 });
     tokenUpdateMany.mockResolvedValue({ modifiedCount: 1 });
@@ -186,6 +211,7 @@ describe('POST /api/materials/add-and-merge', () => {
 
   it('404 when material token not found', async () => {
     findOne.mockResolvedValueOnce(null);
+    seedPaymentAndTransferMocks('LOCKSCRIPT_CONTAINS_PS_MARKER');
     const res = await request(buildApp()).post('/api/materials/add-and-merge').send(validBody);
     expect(res.status).toBe(404);
     expect(res.body).toEqual({ error: 'Material token not found or already consumed' });
@@ -193,7 +219,8 @@ describe('POST /api/materials/add-and-merge', () => {
   });
 
   it('409 when quantity mismatch', async () => {
-    findOne.mockResolvedValueOnce({ _id: 'EXISTING_OID', quantity: 999 });
+    findOne.mockResolvedValueOnce({ _id: EXISTING_OID, quantity: 999 });
+    seedPaymentAndTransferMocks('LOCKSCRIPT_CONTAINS_PS_MARKER');
     const res = await request(buildApp()).post('/api/materials/add-and-merge').send(validBody);
     expect(res.status).toBe(409);
     expect(res.body).toEqual({ error: 'Quantity mismatch: expected 999, got 5' });
@@ -211,16 +238,84 @@ describe('POST /api/materials/add-and-merge', () => {
     expect(enqueue).not.toHaveBeenCalled();
   });
 
-  it('400 when the transfer does not spend the owned material token (no duplication via a junk token)', async () => {
-    findOne.mockResolvedValueOnce(ownedToken);
+  it('404 when the transfer does not spend an owned material token (no duplication via a junk token)', async () => {
     seedPaymentAndTransferMocks('LOCKSCRIPT_CONTAINS_PS_MARKER', [{ sourceTXID: 'JUNKTOKEN', sourceOutputIndex: 0 }]);
 
     const res = await request(buildApp()).post('/api/materials/add-and-merge').send(validBody);
 
-    expect(res.status).toBe(400);
-    expect(res.body).toEqual({ error: 'Transfer does not spend the owned material token' });
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: 'Material token not found or already consumed' });
+    // The token is resolved by the outpoint the transfer spends, not picked arbitrarily.
+    expect(findOne).toHaveBeenCalledWith({
+      userId: 'u1',
+      lootTableId: 'phoenix_feather',
+      tier: 1,
+      consumed: { $ne: true },
+      tokenId: { $in: ['JUNKTOKEN.0'] },
+    });
     expect(updateMany).not.toHaveBeenCalled();
     expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a foreign txid', 'OTHERTX.0'],
+    ['a non-canonical vout', 'TXID1.00'],
+  ])('400 when transferredTokenId names %s', async (_label, transferredTokenId) => {
+    seedPaymentAndTransferMocks('LOCKSCRIPT_CONTAINS_PS_MARKER');
+    const res = await request(buildApp()).post('/api/materials/add-and-merge').send({ ...validBody, transferredTokenId });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: `Transfer outpoint not in transfer transaction: ${transferredTokenId}` });
+    expect(tokenUpdateMany).not.toHaveBeenCalled();
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('400 when the transfer does not carry the whole owned token (on-chain split)', async () => {
+    seedPaymentAndTransferMocks('LOCKSCRIPT_CONTAINS_PS_MARKER', undefined, 1);
+    const res = await request(buildApp()).post('/api/materials/add-and-merge').send(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Transfer must carry the full token quantity (5)' });
+    expect(tokenUpdateMany).not.toHaveBeenCalled();
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('409 when the material token is listed on the marketplace', async () => {
+    seedPaymentAndTransferMocks('LOCKSCRIPT_CONTAINS_PS_MARKER');
+    listingFindOne.mockResolvedValueOnce({ _id: 'LISTING', status: 'active' });
+    const res = await request(buildApp()).post('/api/materials/add-and-merge').send(validBody);
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'Material token is listed on the marketplace' });
+    expect(tokenUpdateMany).not.toHaveBeenCalled();
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('claims nothing when the wallet queue cannot be obtained', async () => {
+    seedPaymentAndTransferMocks('LOCKSCRIPT_CONTAINS_PS_MARKER');
+    getWalletQueue.mockRejectedValueOnce(new Error('queue down'));
+    const res = await request(buildApp()).post('/api/materials/add-and-merge').send(validBody);
+    expect(res.status).toBe(500);
+    expect(tokenUpdateMany).not.toHaveBeenCalled();
+    expect(updateMany).not.toHaveBeenCalled();
+  });
+
+  it('still returns the BEEF when the DB write fails after the merge, keeping both claims', async () => {
+    seedPaymentAndTransferMocks('LOCKSCRIPT_CONTAINS_PS_MARKER');
+    seedEnqueueMocks();
+    updateOne.mockRejectedValueOnce(new Error('db down'));
+
+    const res = await request(buildApp()).post('/api/materials/add-and-merge').send(validBody);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(expect.objectContaining({
+      success: true,
+      dbRecorded: false,
+      mergedTokenId: 'MERGETX.0',
+      transferBeef: 'BEEF_B64',
+      received: { outputIndex: 0, keyId: 'NONCE', counterparty: 'SERVER_ID', tags: ['type:material'] },
+    }));
+    // Claims held: the token is spent and the units are inscribed, so neither may be reused.
+    expect(tokenUpdateMany).toHaveBeenCalledTimes(1);
+    expect(updateMany).toHaveBeenCalledTimes(1);
+    expect(deleteMany).not.toHaveBeenCalled();
   });
 
   it('409 when the material token is already in use by another request', async () => {
@@ -233,7 +328,7 @@ describe('POST /api/materials/add-and-merge', () => {
     expect(res.status).toBe(409);
     expect(res.body).toEqual({ error: 'Material tokens are already in use' });
     expect(tokenUpdateMany).toHaveBeenCalledWith(
-      { userId: 'u1', pendingClaim: { $exists: false }, $or: [{ _id: 'EXISTING_OID', tokenId: 'USERTOKEN.0' }] },
+      { userId: 'u1', pendingClaim: { $exists: false }, $or: [{ _id: EXISTING_OID, tokenId: 'USERTOKEN.0' }] },
       { $set: { pendingClaim: expect.any(String) } },
     );
     expect(updateMany).not.toHaveBeenCalled(); // no inventory units claimed
@@ -264,6 +359,7 @@ describe('POST /api/materials/add-and-merge', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
       success: true,
+      dbRecorded: true,
       mergedTokenId: 'MERGETX.0',
       mergeTransactionId: 'MERGETX',
       newQuantity: 6,
@@ -281,14 +377,15 @@ describe('POST /api/materials/add-and-merge', () => {
     // DB writes happened AFTER the enqueue resolved.
     expect(updateOne).toHaveBeenCalledTimes(1);
     expect(updateOne).toHaveBeenCalledWith(
-      { _id: 'EXISTING_OID', pendingClaim: tokenClaimId() },
+      { _id: EXISTING_OID, userId: 'u1', tokenId: 'USERTOKEN.0', pendingClaim: tokenClaimId() },
       expect.objectContaining({
         $unset: { pendingClaim: '' },
         $set: expect.objectContaining({
           tokenId: 'MERGETX.0',
           quantity: 6,
           previousTokenId: 'TXID1.0',
-          metadata: expect.objectContaining({ itemName: 'Phoenix Feather', rarity: 'legendary', icon: '🪶' }),
+          // acquiredFrom is client-supplied and inscribed on chain, so the server ignores it.
+          metadata: expect.objectContaining({ itemName: 'Phoenix Feather', rarity: 'legendary', icon: '🪶', acquiredFrom: [] }),
         }),
         $push: expect.objectContaining({
           updateHistory: expect.objectContaining({

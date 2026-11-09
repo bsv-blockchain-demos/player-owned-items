@@ -20,6 +20,7 @@ import { decodeBeef, encodeBeef } from '@shared/beefEncoding';
 import { generateNonce, deriveRecipientKey } from '@shared/tokenDerivation';
 import { getLootItemById, type LootItem, type EquipmentStats } from '@shared/loot-table';
 import type { MarketplaceItem } from '@shared/types';
+import { TOKEN_CLAIM_FAILED } from '@server/lib/materialUnits';
 
 export const marketplaceRouter = Router();
 
@@ -607,6 +608,9 @@ marketplaceRouter.post('/list-item', requireAuthProof('list'), async (req: Reque
       return;
     }
 
+    // Stored canonical (lowercase) so crafting/merging can't miss a listing by id case.
+    const materialTokenHex = materialTokenId ? new ObjectId(materialTokenId).toHexString() : undefined;
+
     const {
       usersCollection,
       nftLootCollection,
@@ -725,9 +729,15 @@ marketplaceRouter.post('/list-item', requireAuthProof('list'), async (req: Reque
         return;
       }
 
+      // A craft or merge is spending it.
+      if (token.pendingClaim) {
+        res.status(409).json({ error: TOKEN_CLAIM_FAILED });
+        return;
+      }
+
       // Check if already listed
       const existingListing = await marketplaceItemsCollection.findOne({
-        materialTokenId: materialTokenId,
+        materialTokenId: materialTokenHex,
         status: 'active'
       });
 
@@ -751,7 +761,7 @@ marketplaceRouter.post('/list-item', requireAuthProof('list'), async (req: Reque
       const derivedTransactionId = token.lastTransactionId || token.tokenId?.split('.')[0];
 
       itemData = {
-        materialTokenId: materialTokenId,
+        materialTokenId: materialTokenHex,
         lootTableId: token.lootTableId,
         itemName: lootItem.name,
         itemIcon: lootItem.icon,
@@ -883,8 +893,8 @@ marketplaceRouter.post('/list-item', requireAuthProof('list'), async (req: Reque
         );
       }
     } else if (materialTokenId) {
-      await materialTokensCollection.updateOne(
-        { _id: new ObjectId(materialTokenId), userId },
+      const { modifiedCount } = await materialTokensCollection.updateOne(
+        { _id: new ObjectId(materialTokenId), userId, tokenId: currentTokenId, pendingClaim: { $exists: false } },
         {
           $set: {
             previousTokenId: currentTokenId,
@@ -893,6 +903,13 @@ marketplaceRouter.post('/list-item', requireAuthProof('list'), async (req: Reque
           }
         }
       );
+      // Claimed by a craft or merge since it was read: that request owns the token.
+      if (modifiedCount !== 1) {
+        await marketplaceItemsCollection.deleteOne({ _id: result.insertedId });
+        await marketplaceListingBeefsCollection.deleteOne({ listingId: result.insertedId.toString() });
+        res.status(409).json({ error: TOKEN_CLAIM_FAILED });
+        return;
+      }
     }
 
     res.json({

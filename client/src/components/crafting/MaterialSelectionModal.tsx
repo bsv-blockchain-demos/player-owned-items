@@ -39,7 +39,7 @@ export default function MaterialSelectionModal({ recipe, onClose, onCraft }: Mat
     try {
       setLoading(true);
       // Only fetch minted materials (backend filtering)
-      const response = await apiFetch('/api/inventory/get?mintedOnly=true');
+      const response = await apiFetch('/api/inventory/get?mintedOnly=true&excludeListed=true'); // listed tokens sit in an OrdLock
       const data = await response.json();
 
       if (response.ok && data.success) {

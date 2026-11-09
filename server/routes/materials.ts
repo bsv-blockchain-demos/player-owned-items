@@ -26,6 +26,10 @@ import {
   claimMaterialTokens,
   releaseMaterialTokens,
   TOKEN_CLAIM_FAILED,
+  anyTokenListed,
+  TOKEN_LISTED,
+  voutOf,
+  transferAmount,
 } from '@server/lib/materialUnits';
 
 const CLAIM_FAILED = 'Inventory items missing or already being minted';
@@ -92,7 +96,6 @@ materialsRouter.post('/mint-and-transfer', requireAuthProof('mint-material'), as
     rarity: lootItem.rarity,
     tier,
     quantity: inventoryIds.length,
-    acquiredFrom: requested.acquiredFrom,
   };
 
   // Connect to MongoDB
@@ -133,14 +136,15 @@ materialsRouter.post('/mint-and-transfer', requireAuthProof('mint-material'), as
     return;
   }
 
+  // ALL wallet UTXO-touching work runs inside the serialized queue, obtained before
+  // claiming so a queue failure can't strand the claim.
+  const queue = await getWalletQueue();
+
   const claimId = await claimMaterialUnits(userInventoryCollection, userId, material.lootTableId, tier, inventoryIds);
   if (!claimId) {
     res.status(409).json({ error: CLAIM_FAILED });
     return;
   }
-
-  // ALL wallet UTXO-touching work runs inside the serialized queue.
-  const queue = await getWalletQueue();
   const mint = await queue.enqueue('mint:material', async (serverWallet) => {
     const walletp2pkh = new WalletP2PKH(serverWallet);
     const walletP2pkhUnlockTemplate = walletp2pkh.unlock({
@@ -163,7 +167,7 @@ materialsRouter.post('/mint-and-transfer', requireAuthProof('mint-material'), as
       icon: material.icon,
       rarity: material.rarity,
       tier: material.tier || 1,
-      acquiredFrom: material.acquiredFrom || [],
+      acquiredFrom: [],
     };
 
     const mintLockingScript = ordinalP2PKH.lock(userKey, '', materialMetadata, 'deploy+mint', material.quantity);
@@ -257,7 +261,7 @@ materialsRouter.post('/mint-and-transfer', requireAuthProof('mint-material'), as
         icon: material.icon,
         rarity: material.rarity,
         tier,
-        acquiredFrom: material.acquiredFrom || [],
+        acquiredFrom: [],
       },
       mintOutpoint: mint.tokenId,
       keyId: mint.nonce,
@@ -334,7 +338,6 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
     paymentTx,           // base64 WalletP2PKH payment BEEF
     walletParams,
     reason,
-    acquiredFrom,
     inventoryItemIds,    // unminted UserInventory items being merged in (to consume)
   } = req.body;
 
@@ -379,25 +382,7 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
   }
 
   // Connect to MongoDB
-  const { materialTokensCollection, userInventoryCollection } = await connectToMongo();
-
-  // Verify user owns the material token
-  const existingToken = await materialTokensCollection.findOne({
-    userId,
-    lootTableId,
-    tier,
-    consumed: { $ne: true },
-  });
-
-  if (!existingToken) {
-    res.status(404).json({ error: 'Material token not found or already consumed' });
-    return;
-  }
-
-  if (existingToken.quantity !== currentQuantity) {
-    res.status(409).json({ error: `Quantity mismatch: expected ${existingToken.quantity}, got ${currentQuantity}` });
-    return;
-  }
+  const { materialTokensCollection, userInventoryCollection, marketplaceItemsCollection } = await connectToMongo();
 
   // Pre-lock read: this only needs a wallet handle for getPublicKey (no UTXO ops), so it's
   // safe outside the serialized queue. Same singleton wallet the queue itself uses.
@@ -430,7 +415,11 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
 
   const transferTransaction = Transaction.fromBEEF(decodeBeef(transferBeef));
 
-  const transferOutputIndex = parseInt(transferredTokenId.split('.')[1]);
+  const transferOutputIndex = voutOf(String(transferredTokenId), transferTransaction.id('hex'));
+  if (transferOutputIndex === null) {
+    res.status(400).json({ error: `Transfer outpoint not in transfer transaction: ${transferredTokenId}` });
+    return;
+  }
   const transferOutput = transferTransaction.outputs[transferOutputIndex];
 
   if (!transferOutput) {
@@ -457,12 +446,37 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
     return;
   }
 
-  // Without this, a junk token could be transferred while the real one is kept and re-minted at full quantity.
-  const spendsOwnedToken = transferTransaction.inputs.some(
-    (i) => `${i.sourceTXID || i.sourceTransaction?.id('hex')}.${i.sourceOutputIndex}` === existingToken.tokenId,
+  // The merged token is the one the transfer spends; a user may hold several per material + tier
+  // (e.g. after a marketplace purchase). A junk transfer finds nothing to merge into.
+  const spentOutpoints = transferTransaction.inputs.map(
+    (i) => `${i.sourceTXID || i.sourceTransaction?.id('hex')}.${i.sourceOutputIndex}`,
   );
-  if (!spendsOwnedToken) {
-    res.status(400).json({ error: 'Transfer does not spend the owned material token' });
+  const existingToken = await materialTokensCollection.findOne({
+    userId,
+    lootTableId,
+    tier,
+    consumed: { $ne: true },
+    tokenId: { $in: spentOutpoints },
+  });
+
+  if (!existingToken) {
+    res.status(404).json({ error: 'Material token not found or already consumed' });
+    return;
+  }
+
+  if (existingToken.quantity !== currentQuantity) {
+    res.status(409).json({ error: `Quantity mismatch: expected ${existingToken.quantity}, got ${currentQuantity}` });
+    return;
+  }
+
+  // A partial amount would leave the rest of the token untracked on chain.
+  if (transferAmount(transferOutput.lockingScript) !== existingToken.quantity) {
+    res.status(400).json({ error: `Transfer must carry the full token quantity (${existingToken.quantity})` });
+    return;
+  }
+
+  if (await anyTokenListed(marketplaceItemsCollection, [existingToken._id])) {
+    res.status(409).json({ error: TOKEN_LISTED });
     return;
   }
 
@@ -474,8 +488,11 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
     icon: lootItem.icon,
     rarity: lootItem.rarity,
     tier,
-    acquiredFrom: acquiredFrom ? [acquiredFrom] : [],
+    acquiredFrom: [],
   };
+
+  // Obtained before claiming so a queue failure can't strand the claims.
+  const queue = await getWalletQueue();
 
   const tokenClaimId = await claimMaterialTokens(materialTokensCollection, userId, [
     { _id: existingToken._id, tokenId: existingToken.tokenId },
@@ -493,7 +510,7 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
 
   // Both dependent wallet actions (mint the added quantity, then merge it with the
   // transferred token) run as ONE serialized unit through the wallet queue.
-  const merge = await (await getWalletQueue()).enqueue('merge:material', async (serverWallet) => {
+  const merge = await queue.enqueue('merge:material', async (serverWallet) => {
     // Mint the added quantity to a self-derived key.
 
     const mintNonce = generateNonce();
@@ -656,42 +673,51 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
     throw err;
   });
 
-  // Update the DB index and return the BEEF + nonce.
-
-  await materialTokensCollection.updateOne(
-    { _id: existingToken._id, pendingClaim: tokenClaimId },
-    {
-      $unset: { pendingClaim: '' },
-      $set: {
-        tokenId: merge.mergedTokenId,
-        quantity: currentQuantity + addedQuantity,
-        metadata: materialMetadata,
-        previousTokenId: transferredTokenId,
-        lastTransactionId: merge.mergeTxId,
-        keyId: merge.N3,
-        counterparty: merge.serverIdentityKey,
-        updatedAt: new Date(),
-      },
-      $push: {
-        updateHistory: {
-          operation: 'add',
-          previousQuantity: currentQuantity,
-          newQuantity: currentQuantity + addedQuantity,
-          transactionId: merge.mergeTxId,
-          mergedFrom: [transferredTokenId, merge.mintOutpoint],
-          reason: reason || 'Material addition (server merge)',
-          timestamp: new Date(),
+  // DB writes are best-effort: the merge is already on chain, so the client always
+  // gets the BEEF. On failure both claims stay held, since the token is spent and
+  // the units are inscribed, so neither may be offered again.
+  let dbRecorded = false;
+  try {
+    const { modifiedCount } = await materialTokensCollection.updateOne(
+      { _id: existingToken._id, userId, tokenId: existingToken.tokenId, pendingClaim: tokenClaimId },
+      {
+        $unset: { pendingClaim: '' },
+        $set: {
+          tokenId: merge.mergedTokenId,
+          quantity: currentQuantity + addedQuantity,
+          metadata: materialMetadata,
+          previousTokenId: transferredTokenId,
+          lastTransactionId: merge.mergeTxId,
+          keyId: merge.N3,
+          counterparty: merge.serverIdentityKey,
+          updatedAt: new Date(),
         },
-      },
-    }
-  );
+        $push: {
+          updateHistory: {
+            operation: 'add',
+            previousQuantity: currentQuantity,
+            newQuantity: currentQuantity + addedQuantity,
+            transactionId: merge.mergeTxId,
+            mergedFrom: [transferredTokenId, merge.mintOutpoint],
+            reason: reason || 'Material addition (server merge)',
+            timestamp: new Date(),
+          },
+        },
+      }
+    );
+    if (modifiedCount !== 1) console.error(`[materials:merge] token ${existingToken.tokenId} not updated (claim lost)`);
 
-  // Consume the unminted UserInventory items that fed the added quantity.
-  await consumeMaterialUnits(userInventoryCollection, claimId);
-  step('db written');
+    // Consume the unminted UserInventory items that fed the added quantity.
+    await consumeMaterialUnits(userInventoryCollection, claimId);
+    dbRecorded = true;
+    step('db written');
+  } catch (dbErr) {
+    console.error(`[materials:merge] DB write failed after on-chain merge ${merge.mergeTxId} (claims held):`, dbErr);
+  }
 
   res.json({
     success: true,
+    dbRecorded,
     mergedTokenId: merge.mergedTokenId,
     mergeTransactionId: merge.mergeTxId,
     newQuantity: currentQuantity + addedQuantity,

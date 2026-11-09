@@ -4,7 +4,8 @@ jest.mock('@server/middleware/requireAuthProof', () => ({
 }));
 
 const enqueue = jest.fn((_label: string, fn: (w: any) => Promise<any>) => fn(stubWallet));
-jest.mock('@server/lib/walletQueue', () => ({ getWalletQueue: jest.fn(async () => ({ enqueue })) }));
+const getWalletQueue = jest.fn(async () => ({ enqueue }));
+jest.mock('@server/lib/walletQueue', () => ({ getWalletQueue: () => getWalletQueue() }));
 
 const findOne = jest.fn();
 const insertOne = jest.fn(async () => ({ insertedId: 'MATERIAL_TOKEN_OID' }));
@@ -92,6 +93,18 @@ describe('POST /api/materials/mint-and-transfer', () => {
     updateMany.mockResolvedValue({ modifiedCount: 2 });
     deleteMany.mockResolvedValue({ deletedCount: 2 });
     enqueue.mockImplementation((_label: string, fn: (w: any) => Promise<any>) => fn(stubWallet));
+    getWalletQueue.mockImplementation(async () => ({ enqueue }));
+  });
+
+  it('claims no units when the wallet queue cannot be obtained', async () => {
+    seedTxMocks();
+    findOne.mockResolvedValueOnce(null);
+    getWalletQueue.mockRejectedValueOnce(new Error('queue down'));
+
+    const res = await request(buildApp()).post('/api/materials/mint-and-transfer').send(validBody);
+
+    expect(res.status).toBe(500);
+    expect(updateMany).not.toHaveBeenCalled();
   });
 
   it('400 on empty materials array', async () => {
@@ -253,7 +266,8 @@ describe('POST /api/materials/mint-and-transfer', () => {
     expect(ordLock).toHaveBeenCalledWith(
       'USERKEY',
       '',
-      expect.objectContaining({ itemName: 'Phoenix Feather', description: 'Grants resurrection', icon: '🪶', rarity: 'legendary', tier: 1 }),
+      // acquiredFrom is client-supplied and inscribed on chain, so the server ignores it.
+      expect.objectContaining({ itemName: 'Phoenix Feather', description: 'Grants resurrection', icon: '🪶', rarity: 'legendary', tier: 1, acquiredFrom: [] }),
       'deploy+mint',
       2,
     );
@@ -264,7 +278,11 @@ describe('POST /api/materials/mint-and-transfer', () => {
     expect(stubWallet.signAction).toHaveBeenCalledTimes(1);
 
     // DB writes happened AFTER the enqueue resolved; the claimed units were consumed.
-    expect(insertOne).toHaveBeenCalledWith(expect.objectContaining({ quantity: 2, itemName: 'Phoenix Feather' }));
+    expect(insertOne).toHaveBeenCalledWith(expect.objectContaining({
+      quantity: 2,
+      itemName: 'Phoenix Feather',
+      metadata: expect.objectContaining({ acquiredFrom: [] }),
+    }));
     expect(deleteMany).toHaveBeenCalledWith({ mintClaim: claimId() });
     expect(enqueue.mock.invocationCallOrder[0]).toBeLessThan(insertOne.mock.invocationCallOrder[0]);
 

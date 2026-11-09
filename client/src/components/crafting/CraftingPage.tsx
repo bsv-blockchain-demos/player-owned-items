@@ -64,7 +64,7 @@ export default function CraftingPage() {
       setLoading(true);
 
       // Fetch player materials (only type: 'material' items, minted only)
-      const materialsResponse = await apiFetch('/api/inventory/get?mintedOnly=true');
+      const materialsResponse = await apiFetch('/api/inventory/get?mintedOnly=true&excludeListed=true'); // listed tokens sit in an OrdLock
       const materialsData = await materialsResponse.json();
 
       if (materialsResponse.ok && materialsData.success) {
