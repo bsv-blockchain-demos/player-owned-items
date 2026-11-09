@@ -11,9 +11,11 @@ const updateOne = jest.fn(async () => ({ modifiedCount: 1 }));
 // Inventory units are claimed with updateMany, then deleted (consumed) or unset (released).
 const updateMany = jest.fn(async (_filter: any, _update: any) => ({ modifiedCount: 1 }));
 const deleteMany = jest.fn(async (_filter: any) => ({ deletedCount: 1 }));
+// The existing material token is claimed (pendingClaim) before the wallet queue.
+const tokenUpdateMany = jest.fn(async (_filter: any, _update: any) => ({ modifiedCount: 1 }));
 jest.mock('@server/lib/mongodb', () => ({
   connectToMongo: jest.fn(async () => ({
-    materialTokensCollection: { findOne, updateOne },
+    materialTokensCollection: { findOne, updateOne, updateMany: tokenUpdateMany },
     userInventoryCollection: { updateMany, deleteMany },
   })),
 }));
@@ -104,6 +106,8 @@ function seedPaymentAndTransferMocks(
 
 /** The claim id the route stamped on the inventory units (first updateMany call). */
 const claimId = () => updateMany.mock.calls[0][1].$set.mintClaim as string;
+/** The claim id the route stamped on the material token. */
+const tokenClaimId = () => tokenUpdateMany.mock.calls[0][1].$set.pendingClaim as string;
 
 /** The two dependent wallet actions inside the queue (mint, then merge). */
 function seedEnqueueMocks() {
@@ -142,6 +146,7 @@ describe('POST /api/materials/add-and-merge', () => {
     findOne.mockReset();
     updateOne.mockResolvedValue({ modifiedCount: 1 });
     updateMany.mockResolvedValue({ modifiedCount: 1 });
+    tokenUpdateMany.mockResolvedValue({ modifiedCount: 1 });
     deleteMany.mockResolvedValue({ deletedCount: 1 });
     enqueue.mockImplementation((_label: string, fn: (w: any) => Promise<any>) => fn(stubWallet));
     stubWallet.getPublicKey.mockResolvedValue({ publicKey: 'PK' });
@@ -218,7 +223,24 @@ describe('POST /api/materials/add-and-merge', () => {
     expect(enqueue).not.toHaveBeenCalled();
   });
 
-  it('409 and releases the claim when not every inventory unit could be claimed', async () => {
+  it('409 when the material token is already in use by another request', async () => {
+    findOne.mockResolvedValueOnce(ownedToken);
+    seedPaymentAndTransferMocks('LOCKSCRIPT_CONTAINS_PS_MARKER');
+    tokenUpdateMany.mockResolvedValueOnce({ modifiedCount: 0 });
+
+    const res = await request(buildApp()).post('/api/materials/add-and-merge').send(validBody);
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'Material tokens are already in use' });
+    expect(tokenUpdateMany).toHaveBeenCalledWith(
+      { userId: 'u1', pendingClaim: { $exists: false }, $or: [{ _id: 'EXISTING_OID', tokenId: 'USERTOKEN.0' }] },
+      { $set: { pendingClaim: expect.any(String) } },
+    );
+    expect(updateMany).not.toHaveBeenCalled(); // no inventory units claimed
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('409 and releases both claims when not every inventory unit could be claimed', async () => {
     findOne.mockResolvedValueOnce(ownedToken);
     seedPaymentAndTransferMocks('LOCKSCRIPT_CONTAINS_PS_MARKER');
     updateMany.mockResolvedValueOnce({ modifiedCount: 0 });
@@ -228,6 +250,7 @@ describe('POST /api/materials/add-and-merge', () => {
     expect(res.status).toBe(409);
     expect(res.body).toEqual({ error: 'Inventory items missing or already being minted' });
     expect(updateMany).toHaveBeenLastCalledWith({ mintClaim: claimId() }, { $unset: { mintClaim: '' } });
+    expect(tokenUpdateMany).toHaveBeenLastCalledWith({ pendingClaim: tokenClaimId() }, { $unset: { pendingClaim: '' } });
     expect(enqueue).not.toHaveBeenCalled();
   });
 
@@ -258,8 +281,9 @@ describe('POST /api/materials/add-and-merge', () => {
     // DB writes happened AFTER the enqueue resolved.
     expect(updateOne).toHaveBeenCalledTimes(1);
     expect(updateOne).toHaveBeenCalledWith(
-      { _id: 'EXISTING_OID' },
+      { _id: 'EXISTING_OID', pendingClaim: tokenClaimId() },
       expect.objectContaining({
+        $unset: { pendingClaim: '' },
         $set: expect.objectContaining({
           tokenId: 'MERGETX.0',
           quantity: 6,
@@ -296,6 +320,7 @@ describe('POST /api/materials/add-and-merge', () => {
     expect(res.body).toEqual({ error: 'Internal server error' });
     expect(updateOne).not.toHaveBeenCalled();
     expect(updateMany).toHaveBeenLastCalledWith({ mintClaim: claimId() }, { $unset: { mintClaim: '' } });
+    expect(tokenUpdateMany).toHaveBeenLastCalledWith({ pendingClaim: tokenClaimId() }, { $unset: { pendingClaim: '' } });
     expect(deleteMany).not.toHaveBeenCalled();
   });
 });

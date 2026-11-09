@@ -191,16 +191,11 @@ export function useCraftItemNFT() {
       const transferTx = Transaction.fromAtomicBEEF(transferAction.tx);
       const transferTxId = transferTx.id('hex');
 
+      // The server reads quantities and metadata from each named MaterialToken (nftLootId carries its _id).
       const transferredMaterials = materialInputs.map((input, index) => ({
         lootTableId: input.lootTableId!,
         tokenId: `${transferTxId}.${index}`,
-        quantity: input.currentQuantity!,
-        quantityNeeded: input.quantityNeeded,
-        itemName: input.name,
-        description: input.description!,
-        icon: input.icon!,
-        rarity: input.rarity as 'common' | 'rare' | 'epic' | 'legendary',
-        tier: input.tier || 1,
+        materialTokenId: input.nftLootId!,
       }));
 
       // ===================================================

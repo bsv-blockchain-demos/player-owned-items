@@ -53,6 +53,11 @@ itemsRouter.post('/mint-and-transfer', requireAuthProof('mint-item'), async (req
     res.status(404).json({ error: 'Item not found or not owned by user' });
     return;
   }
+  // Material units are counted into material tokens; minting one as an NFT would let it be both.
+  if (inventoryItem.itemType === 'material') {
+    res.status(400).json({ error: 'Materials are minted as material tokens' });
+    return;
+  }
   if (inventoryItem.nftLootId) {
     res.status(400).json({ error: 'Item already minted' });
     return;

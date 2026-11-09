@@ -242,6 +242,8 @@ describe('POST /api/materials/mint-and-transfer', () => {
         userId: 'u1',
         lootTableId: 'phoenix_feather',
         tier: 1,
+        nftLootId: { $exists: false },
+        tokenId: { $exists: false },
         mintClaim: { $exists: false },
       },
       { $set: { mintClaim: expect.any(String) } },

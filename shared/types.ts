@@ -442,6 +442,7 @@ export interface MaterialToken {
   counterparty?: string;   // Derivation counterparty (the server identity key that locked to user)
   mintOutpoint?: string;   // Server mint outpoint (txid.vout) - proves server minted token
   transferTransactionId?: string; // DEPRECATED: Use mintOutpoint/tokenId instead (redundant)
+  pendingClaim?: string;   // Set while a craft/merge is spending this token
   consumed?: boolean;      // True if token was burned (quantity reached 0)
   consumedAt?: Date;       // When token was burned
   consumeTransactionId?: string; // Transaction ID of burn (no vout needed - item is consumed)

@@ -84,6 +84,14 @@ describe('POST /api/items/mint-and-transfer', () => {
     expect(enqueue).not.toHaveBeenCalled();
   });
 
+  it('400 when the item is a material (materials mint as material tokens, never as NFTs)', async () => {
+    findOne.mockResolvedValueOnce({ lootTableId: 'common_wood', itemType: 'material' });
+    const res = await request(buildApp()).post('/api/items/mint-and-transfer').send(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Materials are minted as material tokens' });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
   it('400 when the item is already minted', async () => {
     findOne.mockResolvedValueOnce({ nftLootId: 'already' });
     const res = await request(buildApp()).post('/api/items/mint-and-transfer').send(validBody);

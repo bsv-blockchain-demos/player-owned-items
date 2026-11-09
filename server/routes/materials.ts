@@ -23,6 +23,9 @@ import {
   claimMaterialUnits,
   releaseMaterialUnits,
   consumeMaterialUnits,
+  claimMaterialTokens,
+  releaseMaterialTokens,
+  TOKEN_CLAIM_FAILED,
 } from '@server/lib/materialUnits';
 
 const CLAIM_FAILED = 'Inventory items missing or already being minted';
@@ -474,8 +477,16 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
     acquiredFrom: acquiredFrom ? [acquiredFrom] : [],
   };
 
+  const tokenClaimId = await claimMaterialTokens(materialTokensCollection, userId, [
+    { _id: existingToken._id, tokenId: existingToken.tokenId },
+  ]);
+  if (!tokenClaimId) {
+    res.status(409).json({ error: TOKEN_CLAIM_FAILED });
+    return;
+  }
   const claimId = await claimMaterialUnits(userInventoryCollection, userId, lootItem.lootId, tier, inventoryIds);
   if (!claimId) {
+    await releaseMaterialTokens(materialTokensCollection, tokenClaimId);
     res.status(409).json({ error: CLAIM_FAILED });
     return;
   }
@@ -641,14 +652,16 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
     };
   }).catch(async (err) => {
     await releaseMaterialUnits(userInventoryCollection, claimId);
+    await releaseMaterialTokens(materialTokensCollection, tokenClaimId);
     throw err;
   });
 
   // Update the DB index and return the BEEF + nonce.
 
   await materialTokensCollection.updateOne(
-    { _id: existingToken._id },
+    { _id: existingToken._id, pendingClaim: tokenClaimId },
     {
+      $unset: { pendingClaim: '' },
       $set: {
         tokenId: merge.mergedTokenId,
         quantity: currentQuantity + addedQuantity,
