@@ -15,10 +15,12 @@ jest.mock('@bsv/wallet-helper', () => ({ WalletP2PKH: class {} }));
 const findOne = jest.fn();
 const insertOne = jest.fn(async () => ({ insertedId: 'NFT_OID' }));
 const updateOne = jest.fn(async () => ({ matchedCount: 1 }));
+const materialFindOne = jest.fn(async (_filter: any): Promise<unknown> => null);
 jest.mock('@server/lib/mongodb', () => ({
   connectToMongo: jest.fn(async () => ({
     userInventoryCollection: { findOne, updateOne },
     nftLootCollection: { insertOne },
+    materialTokensCollection: { findOne: materialFindOne },
   })),
 }));
 
@@ -52,7 +54,7 @@ const body = {
   transferBeef: 'BEEF_B64',
   outpoint: 'MINTTX.0',
   keyId: 'NONCE',
-  itemData: { name: 'Sword', description: 'd', icon: 'i', rarity: 'rare' },
+  itemData: { name: 'game_item', itemName: 'Sword', description: 'd', icon: 'i', rarity: 'rare' },
 };
 
 // tx whose id matches the outpoint and whose output[0] script matches the reconstruction
@@ -61,7 +63,43 @@ function goodTx() {
 }
 
 describe('POST /api/items/mint-and-transfer/record', () => {
-  beforeEach(() => { jest.clearAllMocks(); insertOne.mockResolvedValue({ insertedId: 'NFT_OID' }); });
+  beforeEach(() => {
+    jest.clearAllMocks();
+    insertOne.mockResolvedValue({ insertedId: 'NFT_OID' });
+    materialFindOne.mockResolvedValue(null);
+  });
+
+  it.each([
+    ['stamped as a material', { lootTableId: 'common_wood', itemType: 'material' }],
+    ['a material per the loot table', { lootTableId: 'common_wood' }],
+  ])('400 when the inventory item is %s', async (_label, item) => {
+    findOne.mockResolvedValueOnce(item);
+    const res = await request(buildApp()).post('/api/items/mint-and-transfer/record').send(body);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Materials are minted as material tokens' });
+    expect(insertOne).not.toHaveBeenCalled();
+  });
+
+  it('400 when itemData is not item-mint metadata (e.g. a quantity-1 material token mint)', async () => {
+    findOne.mockResolvedValueOnce({ lootTableId: 'lt1', itemType: 'weapon' });
+    const res = await request(buildApp())
+      .post('/api/items/mint-and-transfer/record')
+      .send({ ...body, itemData: { name: 'material_token', lootTableId: 'common_wood' } });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Not an item mint' });
+    expect(insertOne).not.toHaveBeenCalled();
+  });
+
+  it('409 when the outpoint belongs to a material token', async () => {
+    findOne
+      .mockResolvedValueOnce({ lootTableId: 'lt1', itemType: 'weapon' })
+      .mockResolvedValueOnce(null); // no inventory item holds it
+    materialFindOne.mockResolvedValueOnce({ _id: 'MAT', mintOutpoint: 'MINTTX.0' });
+    const res = await request(buildApp()).post('/api/items/mint-and-transfer/record').send(body);
+    expect(res.status).toBe(409);
+    expect(materialFindOne).toHaveBeenCalledWith({ $or: [{ tokenId: 'MINTTX.0' }, { mintOutpoint: 'MINTTX.0' }] });
+    expect(insertOne).not.toHaveBeenCalled();
+  });
 
   it('400 on missing fields', async () => {
     const res = await request(buildApp()).post('/api/items/mint-and-transfer/record').send({});

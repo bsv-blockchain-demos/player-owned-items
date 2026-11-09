@@ -17,8 +17,15 @@ import { OrdinalsP2PKH } from '@shared/ordinalP2PKH';
 import { broadcastTX } from '@shared/overlayFunctions';
 import { decodeBeef, encodeBeef } from '@shared/beefEncoding';
 import { generateNonce, deriveRecipientKey } from '@shared/tokenDerivation';
+import { getLootItemById } from '@shared/loot-table';
+import type { UserInventory } from '@shared/types';
 
 export const itemsRouter = Router();
+
+// Material units are counted into material tokens; minting one as an NFT would let it be both.
+const MATERIAL_NOT_ITEM = 'Materials are minted as material tokens';
+const isMaterial = (item: UserInventory) =>
+  item.itemType === 'material' || getLootItemById(item.lootTableId)?.type === 'material';
 
 itemsRouter.post('/mint-and-transfer', requireAuthProof('mint-item'), async (req: Request, res: Response) => {
   const userId = req.userId as string; // set by requireAuthProof
@@ -53,9 +60,8 @@ itemsRouter.post('/mint-and-transfer', requireAuthProof('mint-item'), async (req
     res.status(404).json({ error: 'Item not found or not owned by user' });
     return;
   }
-  // Material units are counted into material tokens; minting one as an NFT would let it be both.
-  if (inventoryItem.itemType === 'material') {
-    res.status(400).json({ error: 'Materials are minted as material tokens' });
+  if (isMaterial(inventoryItem)) {
+    res.status(400).json({ error: MATERIAL_NOT_ITEM });
     return;
   }
   if (inventoryItem.nftLootId) {
@@ -235,7 +241,7 @@ itemsRouter.post('/mint-and-transfer/record', requireSession, async (req: Reques
     return;
   }
 
-  const { userInventoryCollection, nftLootCollection } = await connectToMongo();
+  const { userInventoryCollection, nftLootCollection, materialTokensCollection } = await connectToMongo();
   const inventoryItem = await userInventoryCollection.findOne({
     _id: new ObjectId(inventoryItemId),
     userId,
@@ -248,10 +254,21 @@ itemsRouter.post('/mint-and-transfer/record', requireSession, async (req: Reques
     res.status(200).json({ success: true, alreadyRecorded: true, nftId: inventoryItem.nftLootId.toString() });
     return;
   }
+  if (isMaterial(inventoryItem)) {
+    res.status(400).json({ error: MATERIAL_NOT_ITEM });
+    return;
+  }
+  // A quantity-1 material token mint has the same lock shape as an item mint.
+  if (itemData?.name !== 'game_item') {
+    res.status(400).json({ error: 'Not an item mint' });
+    return;
+  }
 
   // Prevent replaying one legit mint across multiple items (fee bypass):
   // reject if this outpoint is already attributed to an inventory item.
-  const alreadyAttributed = await userInventoryCollection.findOne({ tokenId: outpoint });
+  const alreadyAttributed =
+    (await userInventoryCollection.findOne({ tokenId: outpoint })) ??
+    (await materialTokensCollection.findOne({ $or: [{ tokenId: outpoint }, { mintOutpoint: outpoint }] }));
   if (alreadyAttributed) {
     res.status(409).json({ error: 'This mint is already recorded to an item' });
     return;
