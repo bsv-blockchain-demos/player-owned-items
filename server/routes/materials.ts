@@ -17,6 +17,16 @@ import { OrdinalsP2PKH } from '@shared/ordinalP2PKH';
 import { broadcastTX } from '@shared/overlayFunctions';
 import { decodeBeef, encodeBeef } from '@shared/beefEncoding';
 import { TOKEN_PROTOCOL, generateNonce, deriveRecipientKey, deriveSelfKey } from '@shared/tokenDerivation';
+import { getLootItemById } from '@shared/loot-table';
+import {
+  parseInventoryIds,
+  isValidTier,
+  claimMaterialUnits,
+  releaseMaterialUnits,
+  consumeMaterialUnits,
+} from '@server/lib/materialUnits';
+
+const CLAIM_FAILED = 'Inventory items missing or already being minted';
 
 export const materialsRouter = Router();
 
@@ -55,6 +65,34 @@ materialsRouter.post('/mint-and-transfer', requireAuthProof('mint-material'), as
     return;
   }
 
+  // Quantity = owned inventory units; metadata = loot table. Body quantity/cosmetics are ignored.
+  const requested = materials[0];
+  const lootItem = getLootItemById(requested.lootTableId);
+  if (!lootItem || lootItem.type !== 'material') {
+    res.status(400).json({ error: `Not a material: ${requested.lootTableId}` });
+    return;
+  }
+  const tier = requested.tier ?? 1;
+  if (!isValidTier(tier)) {
+    res.status(400).json({ error: 'Invalid tier' });
+    return;
+  }
+  const inventoryIds = parseInventoryIds(requested.inventoryItemIds);
+  if (!inventoryIds) {
+    res.status(400).json({ error: 'Invalid inventoryItemIds' });
+    return;
+  }
+  const material = {
+    lootTableId: lootItem.lootId,
+    itemName: lootItem.name,
+    description: lootItem.description,
+    icon: lootItem.icon,
+    rarity: lootItem.rarity,
+    tier,
+    quantity: inventoryIds.length,
+    acquiredFrom: requested.acquiredFrom,
+  };
+
   // Connect to MongoDB
   const { materialTokensCollection, userInventoryCollection } = await connectToMongo();
 
@@ -70,41 +108,32 @@ materialsRouter.post('/mint-and-transfer', requireAuthProof('mint-material'), as
   const paymentOutpoint = `${paymentTxId}.0`;
   step('validated + payment parsed');
 
-  // Check for existing tokens FIRST (before minting)
-  for (const material of materials) {
-    const existingToken = await materialTokensCollection.findOne({
-      userId,
-      lootTableId: material.lootTableId,
-      tier: material.tier || 1,
-      consumed: { $ne: true },
-    });
+  // Check for an existing token FIRST (before minting)
+  const existingToken = await materialTokensCollection.findOne({
+    userId,
+    lootTableId: material.lootTableId,
+    tier,
+    consumed: { $ne: true },
+  });
 
-    if (existingToken) {
-      res.status(409).json(
-        {
-          error: `Material token already exists`,
-          details: `You already have a ${material.itemName} token. The system will now use the add-and-merge route to properly merge quantities on-chain.`,
-          existingTokenId: existingToken.tokenId,
-          existingQuantity: existingToken.quantity,
-          lootTableId: material.lootTableId,
-          tier: material.tier || 1,
-          shouldUseAddAndMerge: true,
-        },
-      );
-      return;
-    }
-  }
-
-  const material = materials[0];
-
-  // Validate quantity
-  if (material.quantity <= 0 || !Number.isInteger(material.quantity)) {
-    res.status(400).json({ error: `Invalid quantity for ${material.itemName}: ${material.quantity} (must be positive integer)` });
+  if (existingToken) {
+    res.status(409).json(
+      {
+        error: `Material token already exists`,
+        details: `You already have a ${material.itemName} token. The system will now use the add-and-merge route to properly merge quantities on-chain.`,
+        existingTokenId: existingToken.tokenId,
+        existingQuantity: existingToken.quantity,
+        lootTableId: material.lootTableId,
+        tier,
+        shouldUseAddAndMerge: true,
+      },
+    );
     return;
   }
 
-  if (material.quantity > 1_000_000) {
-    res.status(400).json({ error: `Quantity too large for ${material.itemName}: ${material.quantity} (max 1,000,000)` });
+  const claimId = await claimMaterialUnits(userInventoryCollection, userId, material.lootTableId, tier, inventoryIds);
+  if (!claimId) {
+    res.status(409).json({ error: CLAIM_FAILED });
     return;
   }
 
@@ -199,11 +228,15 @@ materialsRouter.post('/mint-and-transfer', requireAuthProof('mint-material'), as
       nonce,
       serverIdentityKey,
     };
+  }).catch(async (err) => {
+    await releaseMaterialUnits(userInventoryCollection, claimId);
+    throw err;
   });
 
   // DB writes are best-effort. The mint is already broadcast on-chain (signAction)
   // and the client will internalize the token into its basket, so a DB failure here
   // is recoverable via POST /mint-and-transfer/record. Never fail the response for it.
+  // Units stay claimed on failure, so they can't be minted twice.
   let dbRecorded = false;
   let materialTokenId: string | undefined;
   try {
@@ -211,7 +244,7 @@ materialsRouter.post('/mint-and-transfer', requireAuthProof('mint-material'), as
       userId,
       lootTableId: material.lootTableId,
       itemName: material.itemName,
-      tier: material.tier || 1,
+      tier,
       tokenId: mint.tokenId,
       quantity: material.quantity,
       metadata: {
@@ -221,7 +254,7 @@ materialsRouter.post('/mint-and-transfer', requireAuthProof('mint-material'), as
         description: material.description,
         icon: material.icon,
         rarity: material.rarity,
-        tier: material.tier || 1,
+        tier,
         acquiredFrom: material.acquiredFrom || [],
       },
       mintOutpoint: mint.tokenId,
@@ -233,14 +266,7 @@ materialsRouter.post('/mint-and-transfer', requireAuthProof('mint-material'), as
     const materialResult = await materialTokensCollection.insertOne(materialTokenDoc);
     materialTokenId = materialResult.insertedId.toString();
 
-    // Consume UserInventory items
-    if (material.inventoryItemIds && material.inventoryItemIds.length > 0) {
-      const objectIds = material.inventoryItemIds.map((id: string) => new ObjectId(id));
-      await userInventoryCollection.deleteMany({
-        _id: { $in: objectIds },
-        userId,
-      });
-    }
+    await consumeMaterialUnits(userInventoryCollection, claimId);
 
     dbRecorded = true;
     step('db written');
@@ -301,11 +327,7 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
     userIdentityKey,     // replaces userPublicKey; derivation counterparty
     lootTableId,
     itemName,
-    description,
-    icon,
-    rarity,
     tier = 1,
-    addedQuantity,
     currentQuantity,
     paymentTx,           // base64 WalletP2PKH payment BEEF
     walletParams,
@@ -330,10 +352,24 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
     return;
   }
 
-  if (addedQuantity <= 0 || !Number.isInteger(addedQuantity)) {
-    res.status(400).json({ error: `Invalid addedQuantity: ${addedQuantity}` });
+  // Added quantity = owned inventory units; metadata = loot table. Body quantity/cosmetics are ignored.
+  const lootItem = getLootItemById(lootTableId);
+  if (!lootItem || lootItem.type !== 'material') {
+    res.status(400).json({ error: `Not a material: ${lootTableId}` });
     return;
   }
+
+  if (!isValidTier(tier)) {
+    res.status(400).json({ error: 'Invalid tier' });
+    return;
+  }
+
+  const inventoryIds = parseInventoryIds(inventoryItemIds);
+  if (!inventoryIds) {
+    res.status(400).json({ error: 'Invalid inventoryItemIds' });
+    return;
+  }
+  const addedQuantity = inventoryIds.length;
 
   if (currentQuantity <= 0 || !Number.isInteger(currentQuantity)) {
     res.status(400).json({ error: `Invalid currentQuantity: ${currentQuantity}` });
@@ -419,16 +455,31 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
     return;
   }
 
+  // Without this, a junk token could be transferred while the real one is kept and re-minted at full quantity.
+  const spendsOwnedToken = transferTransaction.inputs.some(
+    (i) => `${i.sourceTXID || i.sourceTransaction?.id('hex')}.${i.sourceOutputIndex}` === existingToken.tokenId,
+  );
+  if (!spendsOwnedToken) {
+    res.status(400).json({ error: 'Transfer does not spend the owned material token' });
+    return;
+  }
+
   const materialMetadata = {
     name: 'material_token',
-    lootTableId,
-    itemName,
-    description,
-    icon,
-    rarity,
+    lootTableId: lootItem.lootId,
+    itemName: lootItem.name,
+    description: lootItem.description,
+    icon: lootItem.icon,
+    rarity: lootItem.rarity,
     tier,
     acquiredFrom: acquiredFrom ? [acquiredFrom] : [],
   };
+
+  const claimId = await claimMaterialUnits(userInventoryCollection, userId, lootItem.lootId, tier, inventoryIds);
+  if (!claimId) {
+    res.status(409).json({ error: CLAIM_FAILED });
+    return;
+  }
 
   // Both dependent wallet actions (mint the added quantity, then merge it with the
   // transferred token) run as ONE serialized unit through the wallet queue.
@@ -589,6 +640,9 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
       mintOutpoint,
       transferredTokenId,
     };
+  }).catch(async (err) => {
+    await releaseMaterialUnits(userInventoryCollection, claimId);
+    throw err;
   });
 
   // Update the DB index and return the BEEF + nonce.
@@ -621,10 +675,7 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
   );
 
   // Consume the unminted UserInventory items that fed the added quantity.
-  if (Array.isArray(inventoryItemIds) && inventoryItemIds.length > 0) {
-    const objectIds = inventoryItemIds.map((id: string) => new ObjectId(id));
-    await userInventoryCollection.deleteMany({ _id: { $in: objectIds }, userId });
-  }
+  await consumeMaterialUnits(userInventoryCollection, claimId);
   step('db written');
 
   res.json({

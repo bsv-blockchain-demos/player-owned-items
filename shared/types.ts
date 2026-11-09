@@ -127,6 +127,7 @@ export interface UserInventory {
   mintOutpoint?: string;    // Original server mint proof (outpoint: "txid.vout")
   keyId?: string;           // Nonce used to derive the key locking this token (absent = legacy)
   counterparty?: string;    // Derivation counterparty (server identity key)
+  mintClaim?: string;       // Set while this material unit is being minted into a token
 
   // Equipment Customization (Phase 1: Inscriptions)
   prefix?: Inscription;     // Prefix inscription (e.g., "Savage" +5 damage)
