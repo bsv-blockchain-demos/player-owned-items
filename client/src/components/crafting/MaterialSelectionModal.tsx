@@ -1,7 +1,7 @@
 
 import { useEffect, useState } from 'react';
 import { apiFetch } from '@/lib/apiFetch';
-import { CraftingRecipe, MaterialRequirement } from '@/shared/recipe-table';
+import { CraftingRecipe, MaterialRequirement } from '@shared/recipe-table';
 import { getLootItemById } from '@shared/loot-table';
 import { TierBadge, EmpoweredBadge } from '@/components/badges';
 import toast from 'react-hot-toast';

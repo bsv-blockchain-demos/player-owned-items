@@ -1,14 +1,12 @@
 
 import { useEffect, useState, useMemo } from 'react';
 import { apiFetch } from '@/lib/apiFetch';
-import { CraftingRecipe, getAllRecipes } from '@/shared/recipe-table';
+import { CraftingRecipe, getAllRecipes } from '@shared/recipe-table';
 import { getLootItemById, LootItem } from '@shared/loot-table';
 import toast from 'react-hot-toast';
 import CraftingItemDetailsModal from './CraftingItemDetailsModal';
 import CraftedItemModal from './CraftedItemModal';
 import MaterialSelectionModal from './MaterialSelectionModal';
-import { getStatRollQuality } from '@/shared/statRollUtils';
-import { publicKeyToGradient } from '@shared/publicKeyToColor';
 import { useCraftItemNFT } from '@/hooks/useCraftItemNFT';
 import { useAuthContext } from '@/contexts/WalletContext';
 import NavigationButtons from '@/components/navigation/NavigationButtons';
@@ -194,15 +192,6 @@ export default function CraftingPage() {
 
       toast.loading('Preparing blockchain transaction...', { id: craftingToast });
 
-      // Get user's public key for borderGradient
-      const { publicKey } = await userWallet.getPublicKey({
-        protocolID: [0, "monsterbattle"],
-        keyID: "0",
-      });
-
-      // Generate borderGradient from public key
-      const borderGradient = publicKeyToGradient(publicKey);
-
       // Prepare input items for blockchain
       const inputItems = selectedMaterials.map(material => {
         const lootItem = getLootItemById(material.lootTableId);
@@ -226,30 +215,12 @@ export default function CraftingPage() {
         };
       });
 
-      // Prepare output item data
-      const outputItem = {
-        inventoryItemId: '', // Will be created by API
-        lootTableId: recipe.output.lootTableId,
-        name: outputLootItem.name,
-        description: outputLootItem.description,
-        icon: outputLootItem.icon,
-        rarity: outputLootItem.rarity,
-        type: outputLootItem.type as 'weapon' | 'armor' | 'consumable' | 'artifact' | 'material',
-        tier: recipe.output.tier || 1,
-        equipmentStats: outputLootItem.equipmentStats ? { ...outputLootItem.equipmentStats } as Record<string, number> : undefined,
-        crafted: outputLootItem.equipmentStats ? {
-          statRoll: 0.8 + Math.random() * 0.4, // Generate stat roll (0.8-1.2)
-          craftedBy: publicKey
-        } : undefined,
-        borderGradient
-      };
-
-      // Call blockchain crafting hook
+      // Call blockchain crafting hook (server derives the output + stat roll from the recipe)
       const result = await craftItemNFT({
         wallet: userWallet,
         recipeId: recipe.recipeId,
         inputItems,
-        outputItem
+        outputItem: { name: outputLootItem.name }
       });
 
       if (!result.success) {
@@ -262,12 +233,11 @@ export default function CraftingPage() {
       });
 
       // Show crafted item modal if it has stats
-      if (outputItem.crafted && outputItem.crafted.statRoll) {
-        const quality = getStatRollQuality(outputItem.crafted.statRoll);
+      if (result.statRoll) {
         setCraftedItemModal({
           item: outputLootItem,
-          statRoll: outputItem.crafted.statRoll,
-          rolledStats: outputItem.equipmentStats,
+          statRoll: result.statRoll,
+          rolledStats: result.rolledStats,
           isEmpowered: false
         });
       }

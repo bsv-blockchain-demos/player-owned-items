@@ -41,28 +41,13 @@ export interface CraftItemNFTParams {
   wallet: WalletClient;
   recipeId: string;
   inputItems: CraftingInputItem[];
-  outputItem: {
-    inventoryItemId: string;
-    lootTableId: string;
-    name: string;
-    description: string;
-    icon: string;
-    rarity: 'common' | 'rare' | 'epic' | 'legendary';
-    type: 'weapon' | 'armor' | 'consumable' | 'material' | 'artifact';
-    tier?: number;
-    equipmentStats?: Record<string, number>;
-    crafted?: {
-      statRoll: number;
-      craftedBy: string;
-    };
-    borderGradient: {
-      color1: string;
-      color2: string;
-    };
-  };
+  // Display only — the server derives the crafted item from the recipe.
+  outputItem: { name: string };
 }
 
 export interface CraftItemNFTResult {
+  statRoll?: number;
+  rolledStats?: Record<string, number>;
   nftId?: string;
   tokenId?: string;
   transactionId?: string;
@@ -238,19 +223,6 @@ export function useCraftItemNFT() {
             keyId: input.keyId,
             counterparty: input.counterparty,
           })),
-          outputItem: {
-            inventoryItemId: outputItem.inventoryItemId,
-            lootTableId: outputItem.lootTableId,
-            name: outputItem.name,
-            description: outputItem.description,
-            icon: outputItem.icon,
-            rarity: outputItem.rarity,
-            type: outputItem.type,
-            tier: outputItem.tier || 1,
-            equipmentStats: outputItem.equipmentStats || {},
-            crafted: outputItem.crafted || null,
-            borderGradient: outputItem.borderGradient,
-          },
           userIdentityKey,
           paymentTx: encodeBeef(paymentTx),
           batchTransferBeef: encodeBeef(Array.from(transferAction.tx!)),
@@ -281,6 +253,8 @@ export function useCraftItemNFT() {
         transactionId: result.transferTransactionId,
         consumedTokenIds: transferredMaterials.map(m => m.tokenId),
         materialChanges: result.materialChangeTokens || [],
+        statRoll: result.statRoll,
+        rolledStats: result.rolledStats,
         success: true,
       };
 

@@ -10,11 +10,18 @@ const nftInsertOne = jest.fn(async () => ({ insertedId: 'NFT_OID' }));
 const inventoryInsertOne = jest.fn(async () => ({ insertedId: 'INV_OID' }));
 const materialDeleteOne = jest.fn(async () => ({ deletedCount: 1 }));
 const materialUpdateOne = jest.fn(async () => ({ modifiedCount: 1 }));
+// Server-trusted material tokens keyed by lootTableId — the DB, not the body, owns quantity.
+let ownedTokens: Record<string, { tokenId: string; quantity: number; tier: number }> = {};
+const materialFindOne = jest.fn(async (q: { userId: string; lootTableId: string }) =>
+  (q.userId === 'u1' ? ownedTokens[q.lootTableId] ?? null : null));
+let playerLevel = 1;
+const playerStatsFindOne = jest.fn(async () => ({ userId: 'u1', level: playerLevel }));
 jest.mock('@server/lib/mongodb', () => ({
   connectToMongo: jest.fn(async () => ({
     userInventoryCollection: { insertOne: inventoryInsertOne },
     nftLootCollection: { insertOne: nftInsertOne },
-    materialTokensCollection: { deleteOne: materialDeleteOne, updateOne: materialUpdateOne },
+    materialTokensCollection: { findOne: materialFindOne, deleteOne: materialDeleteOne, updateOne: materialUpdateOne },
+    playerStatsCollection: { findOne: playerStatsFindOne },
   })),
 }));
 
@@ -39,9 +46,10 @@ jest.mock('@shared/tokenDerivation', () => ({
   deriveRecipientKey: jest.fn(async () => 'USERKEY'),
   deriveSelfKey: jest.fn(async () => 'MINTKEY'),
 }));
+const ordLock = jest.fn((..._args: unknown[]) => ({ toHex: () => 'LOCKHEX' }));
 jest.mock('@shared/ordinalP2PKH', () => ({
   OrdinalsP2PKH: class {
-    lock() { return { toHex: () => 'LOCKHEX' }; }
+    lock(...args: unknown[]) { return ordLock(...args); }
     unlock() { return { estimateLength: async () => 100 }; }
   },
 }));
@@ -60,6 +68,7 @@ import request from 'supertest';
 import { buildApp } from '@server/app';
 import { Transaction } from '@bsv/sdk';
 import { broadcastTX } from '@shared/overlayFunctions';
+import { publicKeyToGradient } from '@shared/publicKeyToColor';
 
 const stubWallet = {
   createAction: jest.fn(),
@@ -67,22 +76,24 @@ const stubWallet = {
   getPublicKey: jest.fn(async () => ({ publicKey: 'PK' })),
 };
 
+// craft_wooden_sword: 5 common_wood + 2 common_leather -> common_dagger (tier 1).
+// outputItem and per-material quantity/metadata are FORGED to prove the server ignores them.
 const validBody = {
-  recipeId: 'iron_sword_recipe',
+  recipeId: 'craft_wooden_sword',
   transferredMaterials: [
-    { lootTableId: 'wood', tokenId: 'BATCHTX.0', quantity: 5, quantityNeeded: 3, itemName: 'Wood', description: 'd', icon: '🪵', rarity: 'common', tier: 1 },
-    { lootTableId: 'stone', tokenId: 'BATCHTX.1', quantity: 2, quantityNeeded: 2, itemName: 'Stone', description: 'd', icon: '🪨', rarity: 'common', tier: 1 },
+    { lootTableId: 'common_wood', tokenId: 'BATCHTX.0', quantity: 1000, quantityNeeded: 1, itemName: 'Forged', description: 'x', icon: 'x', rarity: 'legendary', tier: 5 },
+    { lootTableId: 'common_leather', tokenId: 'BATCHTX.1', quantity: 1000, quantityNeeded: 1, itemName: 'Forged', description: 'x', icon: 'x', rarity: 'legendary', tier: 5 },
   ],
   outputItem: {
-    lootTableId: 'iron_sword',
-    name: 'Iron Sword',
-    description: 'A sturdy sword',
-    icon: '⚔️',
-    rarity: 'rare',
+    lootTableId: 'excalibur',
+    name: 'Excalibur',
+    description: 'forged',
+    icon: 'x',
+    rarity: 'legendary',
     type: 'weapon',
-    tier: 1,
-    equipmentStats: { damageBonus: 10 },
-    crafted: { statRoll: 1.1 },
+    tier: 5,
+    equipmentStats: { damageBonus: 9999 },
+    crafted: { statRoll: 1.2 },
     borderGradient: { color1: 'a', color2: 'b' },
   },
   userIdentityKey: 'USER_ID_KEY',
@@ -92,11 +103,21 @@ const validBody = {
   walletParams: { protocolID: [0, 'x'], keyID: '1', counterparty: 'cp' },
 };
 
+const defaultOwnedTokens = () => ({
+  common_wood: { tokenId: 'WOODTX.0', quantity: 7, tier: 1 },
+  common_leather: { tokenId: 'LEATHERTX.0', quantity: 2, tier: 1 },
+});
+const defaultBatchInputs = [
+  { sourceTXID: 'WOODTX', sourceOutputIndex: 0 },
+  { sourceTXID: 'LEATHERTX', sourceOutputIndex: 0 },
+];
+
 /** payment tx + batch-transfer tx — reached by every request past field validation. */
-function seedPaymentAndBatchMocks(scriptHexes: string[]) {
+function seedPaymentAndBatchMocks(scriptHexes: string[], inputs = defaultBatchInputs) {
   (Transaction.fromBEEF as jest.Mock)
     .mockReturnValueOnce({ id: () => 'PAYTXID', outputs: [{ satoshis: 100 }] })
     .mockReturnValueOnce({
+      inputs,
       outputs: scriptHexes.map((hex) => ({ lockingScript: { toHex: () => hex } })),
       toBEEF: () => [1, 1],
     });
@@ -132,7 +153,7 @@ function seedEnqueueMocks() {
     .mockResolvedValueOnce({ tx: Uint8Array.from([9, 9]) }) // mint
     .mockResolvedValueOnce({ tx: Uint8Array.from([11, 11]) }); // transfer
 
-  // mintNonce, itemNonce, changeNonce (only "wood" has change)
+  // mintNonce, itemNonce, changeNonce (only common_wood has change)
   nonceQueue = ['N_MINT', 'N_ITEM', 'N_CHANGE'];
 }
 
@@ -148,7 +169,11 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     enqueue.mockImplementation((_label: string, fn: (w: any) => Promise<any>) => fn(stubWallet));
     stubWallet.getPublicKey.mockResolvedValue({ publicKey: 'PK' });
     nonceQueue = [];
+    ownedTokens = defaultOwnedTokens();
+    playerLevel = 1;
   });
+
+  afterEach(() => jest.restoreAllMocks());
 
   it('400 on missing transferredMaterials', async () => {
     const res = await request(buildApp()).post('/api/crafting/mint-and-transfer').send({
@@ -160,10 +185,10 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     expect(enqueue).not.toHaveBeenCalled();
   });
 
-  it('400 on missing outputItem/userIdentityKey', async () => {
+  it('400 on missing userIdentityKey', async () => {
     const res = await request(buildApp()).post('/api/crafting/mint-and-transfer').send({
       ...validBody,
-      outputItem: undefined,
+      userIdentityKey: undefined,
     });
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Missing required fields' });
@@ -200,8 +225,70 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     expect(enqueue).not.toHaveBeenCalled();
   });
 
+  it('400 on an unknown recipeId', async () => {
+    const res = await request(buildApp()).post('/api/crafting/mint-and-transfer').send({
+      ...validBody,
+      recipeId: 'craft_free_excalibur',
+    });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Unknown recipe: craft_free_excalibur' });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('400 when a required material is missing from the transfer', async () => {
+    const res = await request(buildApp()).post('/api/crafting/mint-and-transfer').send({
+      ...validBody,
+      transferredMaterials: [validBody.transferredMaterials[0]],
+    });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Transferred materials do not match recipe craft_wooden_sword' });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('400 when an extra or duplicated material is transferred', async () => {
+    const res = await request(buildApp()).post('/api/crafting/mint-and-transfer').send({
+      ...validBody,
+      transferredMaterials: [...validBody.transferredMaterials, validBody.transferredMaterials[0]],
+    });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Transferred materials do not match recipe craft_wooden_sword' });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('403 when the player is below the recipe unlock level', async () => {
+    playerLevel = 2; // craft_iron_sword unlocks at level 3
+    const res = await request(buildApp()).post('/api/crafting/mint-and-transfer').send({
+      ...validBody,
+      recipeId: 'craft_iron_sword',
+      transferredMaterials: [
+        { lootTableId: 'rare_steel', tokenId: 'BATCHTX.0' },
+        { lootTableId: 'common_wood', tokenId: 'BATCHTX.1' },
+        { lootTableId: 'common_leather', tokenId: 'BATCHTX.2' },
+      ],
+    });
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: 'Recipe craft_iron_sword requires level 3' });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('400 when the user owns no token for a required material', async () => {
+    delete (ownedTokens as Record<string, unknown>).common_leather;
+    const res = await request(buildApp()).post('/api/crafting/mint-and-transfer').send(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Material common_leather not owned' });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('400 when the owned quantity is below the recipe requirement (client quantity ignored)', async () => {
+    ownedTokens.common_leather.quantity = 1; // recipe needs 2; body claims 1000
+    const res = await request(buildApp()).post('/api/crafting/mint-and-transfer').send(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Insufficient common_leather: need 2, have 1' });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
   it('404 when a transferred material output is not found (rejects before enqueue)', async () => {
-    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0']); // only one output — "stone" at vout 1 is missing
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0']); // only one output — common_leather at vout 1 is missing
 
     const res = await request(buildApp()).post('/api/crafting/mint-and-transfer').send(validBody);
 
@@ -216,29 +303,27 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     const res = await request(buildApp()).post('/api/crafting/mint-and-transfer').send(validBody);
 
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({ error: 'Material stone not locked to server derived key' });
+    expect(res.body).toEqual({ error: 'Material common_leather not locked to server derived key' });
     expect(enqueue).not.toHaveBeenCalled();
   });
 
-  it('400 when a material quantity is insufficient (rejects before enqueue)', async () => {
-    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1']);
+  it('400 when the batch transfer does not spend the owned material token', async () => {
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1'], [
+      { sourceTXID: 'WOODTX', sourceOutputIndex: 0 },
+      { sourceTXID: 'SOMEOTHERTX', sourceOutputIndex: 3 },
+    ]);
 
-    const res = await request(buildApp()).post('/api/crafting/mint-and-transfer').send({
-      ...validBody,
-      transferredMaterials: [
-        validBody.transferredMaterials[0],
-        { ...validBody.transferredMaterials[1], quantity: 1, quantityNeeded: 2 },
-      ],
-    });
+    const res = await request(buildApp()).post('/api/crafting/mint-and-transfer').send(validBody);
 
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({ error: 'Insufficient stone: need 2, have 1' });
+    expect(res.body).toEqual({ error: 'Material common_leather transfer does not spend owned token' });
     expect(enqueue).not.toHaveBeenCalled();
   });
 
-  it('mints + transfers via the wallet queue as one dependent unit, writes DB after, returns the success shape', async () => {
+  it('mints the recipe output (ignoring forged outputItem) via the wallet queue, writes DB after, returns the success shape', async () => {
     seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1']);
     seedEnqueueMocks();
+    jest.spyOn(Math, 'random').mockReturnValue(0.75); // statRoll = 0.8 + 0.75 * 0.4 = 1.1
 
     const res = await request(buildApp()).post('/api/crafting/mint-and-transfer').send(validBody);
 
@@ -248,7 +333,9 @@ describe('POST /api/crafting/mint-and-transfer', () => {
       nftId: 'NFT_OID',
       tokenId: 'TRANSFERTX.0',
       transferTransactionId: 'TRANSFERTX',
-      materialChangeTokens: [{ lootTableId: 'wood', tokenId: 'TRANSFERTX.1', quantity: 2 }],
+      materialChangeTokens: [{ lootTableId: 'common_wood', tokenId: 'TRANSFERTX.1', quantity: 2 }],
+      statRoll: 1.1,
+      rolledStats: { damageBonus: 1, autoClickRate: 0.55 },
       transferBeef: 'BEEF_B64',
       received: [
         { outputIndex: 0, keyId: 'N_ITEM', counterparty: 'SERVER_ID', tags: ['type:item'] },
@@ -262,11 +349,35 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     expect(stubWallet.createAction).toHaveBeenCalledTimes(2);
     expect(stubWallet.signAction).toHaveBeenCalledTimes(2);
 
+    // Inscribed metadata comes from the recipe + loot table, not the request body.
+    const craftedMetadata = expect.objectContaining({
+      itemName: 'Rusty Dagger',
+      rarity: 'common',
+      itemType: 'weapon',
+      tier: 1,
+      stats: { damageBonus: 1, autoClickRate: 0.5 },
+      crafted: { statRoll: 1.1, craftedBy: 'u1' },
+      visual: { borderGradient: publicKeyToGradient('u1') },
+    });
+    expect(ordLock).toHaveBeenCalledWith('MINTKEY', '', craftedMetadata, 'deploy+mint', 1);
+    expect(ordLock).toHaveBeenCalledWith('USERKEY', 'MINTTX_0', craftedMetadata, 'transfer', 1);
+    // Material change: owned 7 - recipe 5 = 2, with loot-table metadata.
+    expect(ordLock).toHaveBeenCalledWith(
+      'USERKEY',
+      'BATCHTX_0',
+      { name: 'material_token', lootTableId: 'common_wood', itemName: 'Wooden Plank', description: 'Rough lumber for crafting', icon: '🪵', rarity: 'common', tier: 1 },
+      'transfer',
+      2,
+    );
+
     // DB writes happened AFTER the enqueue resolved.
     expect(nftInsertOne).toHaveBeenCalledTimes(1);
     expect(nftInsertOne).toHaveBeenCalledWith(
       expect.objectContaining({
-        lootTableId: 'iron_sword',
+        lootTableId: 'common_dagger',
+        name: 'Rusty Dagger',
+        rarity: 'common',
+        type: 'weapon',
         mintOutpoint: 'MINTTX.0',
         tokenId: 'TRANSFERTX.0',
         keyId: 'N_ITEM',
@@ -277,29 +388,32 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     expect(inventoryInsertOne).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: 'u1',
-        lootTableId: 'iron_sword',
+        lootTableId: 'common_dagger',
+        itemType: 'weapon',
+        tier: 1,
         crafted: true,
         statRoll: 1.1,
-        rolledStats: { damageBonus: 11 },
+        rolledStats: { damageBonus: 1, autoClickRate: 0.55 },
+        borderGradient: publicKeyToGradient('u1'),
         tokenId: 'TRANSFERTX.0',
       }),
     );
-    // "stone" was fully consumed (quantity === quantityNeeded) → deleted.
+    // common_leather was fully consumed (owned 2, needed 2) → deleted.
     expect(materialDeleteOne).toHaveBeenCalledTimes(1);
-    expect(materialDeleteOne).toHaveBeenCalledWith({ userId: 'u1', lootTableId: 'stone' });
-    // "wood" had leftover change → updated in place.
+    expect(materialDeleteOne).toHaveBeenCalledWith({ userId: 'u1', lootTableId: 'common_leather' });
+    // common_wood had leftover change → updated in place.
     expect(materialUpdateOne).toHaveBeenCalledTimes(1);
     expect(materialUpdateOne).toHaveBeenCalledWith(
-      { userId: 'u1', lootTableId: 'wood' },
+      { userId: 'u1', lootTableId: 'common_wood' },
       expect.objectContaining({
         $set: expect.objectContaining({ tokenId: 'TRANSFERTX.1', quantity: 2, keyId: 'N_CHANGE', counterparty: 'SERVER_ID' }),
         $push: expect.objectContaining({
           updateHistory: expect.objectContaining({
             operation: 'subtract',
-            previousQuantity: 5,
+            previousQuantity: 7,
             newQuantity: 2,
             transactionId: 'TRANSFERTX',
-            reason: 'Consumed in crafting recipe: iron_sword_recipe',
+            reason: 'Consumed in crafting recipe: craft_wooden_sword',
           }),
         }),
       }),
