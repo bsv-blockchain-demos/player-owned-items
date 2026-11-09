@@ -5,7 +5,6 @@
 // internalize into its wallet basket.
 
 import { Router, type Request, type Response } from 'express';
-import { ObjectId } from 'mongodb';
 import { Transaction, P2PKH, Beef, Hash } from '@bsv/sdk';
 import { WalletP2PKH } from '@bsv/wallet-helper';
 import { requireAuthProof } from '@server/middleware/requireAuthProof';
@@ -748,88 +747,5 @@ materialsRouter.post('/check-token', requireSession, async (req: Request, res: R
   } catch (error) {
     console.error('Error checking material token:', error);
     res.status(500).json({ error: 'Failed to check material token' });
-  }
-});
-
-// Updates MaterialToken documents after successful blockchain token updates.
-materialsRouter.post('/update-tokens', requireAuthProof('update-material'), async (req: Request, res: Response) => {
-  try {
-    const userId = req.userId as string;
-    const body = req.body;
-
-    const { updates } = body;
-
-    // Validate required fields
-    if (!updates || !Array.isArray(updates) || updates.length === 0) {
-      res.status(400).json({ error: 'Invalid or empty updates array' });
-      return;
-    }
-
-    // Connect to MongoDB and get collections
-    const { materialTokensCollection, userInventoryCollection } = await connectToMongo();
-
-    // Process each update
-    for (const update of updates) {
-      // Find the material token by lootTableId and userId
-      const existingToken = await materialTokensCollection.findOne({
-        userId: userId,
-        lootTableId: update.lootTableId,
-        tokenId: update.previousTokenId,
-      });
-
-      if (!existingToken) {
-        console.warn(`Material token not found: ${update.lootTableId} with tokenId ${update.previousTokenId}`);
-        continue;
-      }
-
-      if (update.newQuantity === 0) {
-        // Token burned - delete from database (provenance is on-chain and in Overlay system)
-        await materialTokensCollection.deleteOne(
-          { _id: existingToken._id }
-        );
-      } else {
-        // Token updated - update with new token ID and quantity
-        await materialTokensCollection.updateOne(
-          { _id: existingToken._id },
-          {
-            $set: {
-              tokenId: update.newTokenId,
-              quantity: update.newQuantity,
-              previousTokenId: update.previousTokenId,
-              lastTransactionId: update.transactionId,
-              updatedAt: new Date(),
-            },
-            $push: {
-              updateHistory: {
-                operation: update.operation,
-                previousQuantity: update.previousQuantity,
-                newQuantity: update.newQuantity,
-                transactionId: update.transactionId,
-                reason: update.reason || null,
-                timestamp: new Date(),
-              }
-            }
-          }
-        );
-      }
-
-      // Consume UserInventory items if provided (for 'add' operations from inventory)
-      if (update.inventoryItemIds && update.inventoryItemIds.length > 0) {
-        const objectIds = update.inventoryItemIds.map((id: string) => new ObjectId(id));
-
-        await userInventoryCollection.deleteMany({
-          _id: { $in: objectIds },
-          userId: userId,  // Security: ensure user owns these items
-        });
-      }
-    }
-
-    res.json({
-      success: true,
-      count: updates.length,
-    });
-  } catch (error) {
-    console.error('Error in /api/materials/update-tokens:', error);
-    res.status(500).json({ error: 'Internal server error' });
   }
 });
