@@ -114,15 +114,59 @@ describe('POST /api/inscriptions/apply', () => {
     expect(res.body.goldCost).toBe(250);
     expect(res.body.equipment.suffix).toEqual({ type: 'damage', value: 3, name: 'of Fury' });
 
+    // Writes re-check the docs are still unminted (a mint could land mid-request).
     expect(userInventoryUpdateOne).toHaveBeenCalledWith(
-      { _id: new ObjectId(equipmentId) },
+      { _id: new ObjectId(equipmentId), userId: 'user-123', nftLootId: { $not: { $type: 'objectId' } } },
       { $set: { suffix: { type: 'damage', value: 3, name: 'of Fury' } } },
     );
     expect(playerStatsUpdateOne).toHaveBeenCalledWith(
       { userId: 'user-123' },
       { $inc: { coins: -250 } },
     );
-    expect(userInventoryDeleteOne).toHaveBeenCalledWith({ _id: new ObjectId(scrollId) });
+    expect(userInventoryDeleteOne).toHaveBeenCalledWith({ _id: new ObjectId(scrollId), userId: 'user-123', nftLootId: { $not: { $type: 'objectId' } } });
+  });
+
+  // A minted item's inscription lives on chain; a DB-only edit would desync it and let a
+  // minted scroll be spent here and again (or listed / claimed by a craft) as a token.
+  it.each([
+    ['equipment', { equipment: { nftLootId: new ObjectId() }, scroll: {} }],
+    ['scroll', { equipment: {}, scroll: { nftLootId: new ObjectId() } }],
+  ])('400s when the %s is minted', async (_label, overrides) => {
+    seedValidProof();
+    playerStatsFindOne.mockResolvedValueOnce(basePlayerStats());
+    userInventoryFindOne
+      .mockResolvedValueOnce(baseEquipment(overrides.equipment))
+      .mockResolvedValueOnce(baseScroll(overrides.scroll));
+    getLootItemById.mockReturnValueOnce(baseScrollTemplate());
+
+    const res = await request(appWithInscriptionsRouter())
+      .post('/api/inscriptions/apply')
+      .set('Cookie', await authCookie())
+      .send({ proof: {}, equipmentId, scrollId });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Minted items are inscribed on chain through the Blacksmith' });
+    expect(userInventoryUpdateOne).not.toHaveBeenCalled();
+    expect(playerStatsUpdateOne).not.toHaveBeenCalled();
+    expect(userInventoryDeleteOne).not.toHaveBeenCalled();
+  });
+
+  it('409s and charges nothing when the equipment was minted before the write', async () => {
+    seedValidProof();
+    playerStatsFindOne.mockResolvedValueOnce(basePlayerStats());
+    userInventoryFindOne.mockResolvedValueOnce(baseEquipment()).mockResolvedValueOnce(baseScroll());
+    getLootItemById.mockReturnValueOnce(baseScrollTemplate());
+    userInventoryUpdateOne.mockResolvedValueOnce({ matchedCount: 0 });
+
+    const res = await request(appWithInscriptionsRouter())
+      .post('/api/inscriptions/apply')
+      .set('Cookie', await authCookie())
+      .send({ proof: {}, equipmentId, scrollId });
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'Equipment changed during the request' });
+    expect(playerStatsUpdateOne).not.toHaveBeenCalled();
+    expect(userInventoryDeleteOne).not.toHaveBeenCalled();
   });
 
   it('400s on the autoclick/lifesteal exclusivity conflict (opposite slot already has the same type)', async () => {
