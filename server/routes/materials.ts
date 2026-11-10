@@ -29,9 +29,8 @@ import {
   anyTokenListed,
   TOKEN_LISTED,
   voutOf,
-  transferAmount,
 } from '@server/lib/materialUnits';
-import { inscribedLootTableId } from '@server/lib/tokenScript';
+import { transferAmount, inscribedLootTableId, inscribedAssetId, mintAssetId } from '@server/lib/tokenScript';
 
 const CLAIM_FAILED = 'Inventory items missing or already being minted';
 
@@ -482,6 +481,18 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
     return;
   }
 
+  // The merged output keeps the stack's BSV-21 id (its mint); the new units join it.
+  const stackAssetId = mintAssetId(existingToken.mintOutpoint);
+  if (!stackAssetId) {
+    res.status(400).json({ error: 'Material token has no recorded mint' });
+    return;
+  }
+  const namedAssetId = inscribedAssetId(transferOutput.lockingScript);
+  if (namedAssetId !== stackAssetId) {
+    res.status(400).json({ error: `Transfer names asset ${namedAssetId ?? 'none'}, not the stack's mint ${stackAssetId}` });
+    return;
+  }
+
   if (await anyTokenListed(marketplaceItemsCollection, [existingToken._id])) {
     res.status(409).json({ error: TOKEN_LISTED });
     return;
@@ -578,9 +589,7 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
     const userKey = await deriveRecipientKey(serverWallet, userIdentityKey, N3);
 
     const newQuantity = currentQuantity + addedQuantity;
-    const mergedAssetId = mintOutpoint.replace('.', '_');
-
-    const mergeLockingScript = ordinalP2PKH.lock(userKey, mergedAssetId, materialMetadata, 'transfer', newQuantity);
+    const mergeLockingScript = ordinalP2PKH.lock(userKey, stackAssetId, materialMetadata, 'transfer', newQuantity);
 
     // Two separate unlock templates — each has its own derivation
     const transferredUnlock = ordinalP2PKH.unlock(
@@ -780,6 +789,7 @@ materialsRouter.post('/check-token', requireSession, async (req: Request, res: R
         exists: true,
         token: {
           tokenId: existingToken.tokenId,
+          mintOutpoint: existingToken.mintOutpoint, // the merge transfer's BSV-21 id
           quantity: existingToken.quantity,
           keyId: existingToken.keyId,
           counterparty: existingToken.counterparty,

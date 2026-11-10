@@ -68,6 +68,7 @@ describe('POST /api/materials/check-token', () => {
   it('200s and returns the existing token (happy path)', async () => {
     materialTokensFindOne.mockResolvedValueOnce({
       tokenId: 'abcd.0',
+      mintOutpoint: 'mint.0',
       quantity: 5,
       keyId: 'NONCE1',
       counterparty: 'SERVER_ID',
@@ -83,6 +84,7 @@ describe('POST /api/materials/check-token', () => {
       exists: true,
       token: {
         tokenId: 'abcd.0',
+        mintOutpoint: 'mint.0',
         quantity: 5,
         keyId: 'NONCE1',
         counterparty: 'SERVER_ID',

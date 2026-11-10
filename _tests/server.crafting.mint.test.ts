@@ -14,7 +14,7 @@ const materialUpdateOne = jest.fn(async (_filter: any, _update: any) => ({ modif
 // Token claim (and release) — by default every token in the $or claims successfully.
 const materialUpdateMany = jest.fn(async (filter: any, _update: any) => ({ modifiedCount: filter.$or?.length ?? 0 }));
 // Server-trusted material tokens keyed by DB id — the DB, not the body, owns quantity.
-type OwnedToken = { lootTableId: string; tokenId: string; quantity: number; tier: number };
+type OwnedToken = { lootTableId: string; tokenId: string; quantity: number; tier: number; mintOutpoint?: string };
 let ownedTokens: Record<string, OwnedToken> = {};
 const materialFindOne = jest.fn(async (q: { _id: { toHexString(): string }; userId: string; lootTableId: string }) => {
   const t = ownedTokens[q._id.toHexString()];
@@ -22,7 +22,7 @@ const materialFindOne = jest.fn(async (q: { _id: { toHexString(): string }; user
 });
 const listingFindOne = jest.fn(async (_filter: any): Promise<unknown> => null);
 // Minted item NFTs (artifact recipe inputs) keyed by inventory id.
-type OwnedItem = { lootTableId: string; tokenId: string };
+type OwnedItem = { lootTableId: string; tokenId: string; mintOutpoint?: string };
 let ownedItems: Record<string, OwnedItem> = {};
 const inventoryFindOne = jest.fn(async (q: any) => {
   const t = ownedItems[q._id.toHexString()];
@@ -138,25 +138,31 @@ const validBody = {
 };
 
 const defaultOwnedTokens = (): Record<string, OwnedToken> => ({
-  [WOOD]: { lootTableId: 'common_wood', tokenId: 'WOODTX.0', quantity: 7, tier: 1 },
-  [LEATHER]: { lootTableId: 'common_leather', tokenId: 'LEATHERTX.0', quantity: 2, tier: 1 },
-  [WOOD_T3]: { lootTableId: 'common_wood', tokenId: 'WOODT3TX.0', quantity: 4, tier: 3 },
+  [WOOD]: { lootTableId: 'common_wood', tokenId: 'WOODTX.0', quantity: 7, tier: 1, mintOutpoint: 'WOODMINT.0' },
+  [LEATHER]: { lootTableId: 'common_leather', tokenId: 'LEATHERTX.0', quantity: 2, tier: 1, mintOutpoint: 'LEATHERMINT.0' },
+  [WOOD_T3]: { lootTableId: 'common_wood', tokenId: 'WOODT3TX.0', quantity: 4, tier: 3, mintOutpoint: 'WOODT3MINT.0' },
 });
 const defaultBatchInputs = [
   { sourceTXID: 'WOODTX', sourceOutputIndex: 0 },
   { sourceTXID: 'LEATHERTX', sourceOutputIndex: 0 },
 ];
 
-const inscribed = (hex: string, amt: number, lootTableId: string) => inscribedScript(hex, amt, { lootTableId });
+const inscribed = (hex: string, amt: number, lootTableId: string, assetId: string) => inscribedScript(hex, amt, { lootTableId }, assetId);
 
 /** payment tx + batch-transfer tx — reached by every request past field validation. */
-function seedPaymentAndBatchMocks(scriptHexes: string[], inputs = defaultBatchInputs, amts = [7, 2], lootIds = ['common_wood', 'common_leather']) {
+function seedPaymentAndBatchMocks(
+  scriptHexes: string[],
+  inputs = defaultBatchInputs,
+  amts = [7, 2],
+  lootIds = ['common_wood', 'common_leather'],
+  assetIds = ['WOODMINT_0', 'LEATHERMINT_0'],
+) {
   (Transaction.fromBEEF as jest.Mock)
     .mockReturnValueOnce({ id: () => 'PAYTXID', outputs: [{ satoshis: 100 }] })
     .mockReturnValueOnce({
       id: () => 'BATCHTX',
       inputs,
-      outputs: scriptHexes.map((hex, i) => ({ lockingScript: inscribed(hex, amts[i], lootIds[i]) })),
+      outputs: scriptHexes.map((hex, i) => ({ lockingScript: inscribed(hex, amts[i], lootIds[i], assetIds[i]) })),
       toBEEF: () => [1, 1],
     });
 }
@@ -385,6 +391,23 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     expectNotClaimed();
   });
 
+  it('400 when a transfer names another asset id than the owned token\'s mint', async () => {
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1'], defaultBatchInputs, [7, 2], undefined, ['WOODMINT_0', 'LEATHERTX_0']);
+    const res = await post(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Material common_leather transfer names asset LEATHERTX_0, not its mint LEATHERMINT_0' });
+    expectNotClaimed();
+  });
+
+  it('400 when the owned token has no recorded mint', async () => {
+    delete ownedTokens[LEATHER].mintOutpoint;
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1']);
+    const res = await post(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Material common_leather has no recorded mint' });
+    expectNotClaimed();
+  });
+
   it('400 when a transfer output does not carry the whole owned token (on-chain split)', async () => {
     seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1'], defaultBatchInputs, [7, 1]);
     const res = await post(validBody);
@@ -507,9 +530,10 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     expect(ordLock).toHaveBeenCalledWith('MINTKEY', '', craftedMetadata, 'deploy+mint', 1);
     expect(ordLock).toHaveBeenCalledWith('USERKEY', 'MINTTX_0', craftedMetadata, 'transfer', 1);
     // Material change: owned 7 - recipe 5 = 2, with loot-table metadata.
+    // Change keeps the stack's BSV-21 id: its mint outpoint, not the batch outpoint it came through.
     expect(ordLock).toHaveBeenCalledWith(
       'USERKEY',
-      'BATCHTX_0',
+      'WOODMINT_0',
       { name: 'material_token', lootTableId: 'common_wood', itemName: 'Wooden Plank', description: 'Rough lumber for crafting', icon: '🪵', rarity: 'common', tier: 1 },
       'transfer',
       2,
@@ -593,7 +617,7 @@ describe('POST /api/crafting/mint-and-transfer', () => {
       { sourceTXID: 'WOODTX', sourceOutputIndex: 0 },
       { sourceTXID: 'WOODT3TX', sourceOutputIndex: 0 },
       { sourceTXID: 'LEATHERTX', sourceOutputIndex: 0 },
-    ], [3, 4, 2], ['common_wood', 'common_wood', 'common_leather']);
+    ], [3, 4, 2], ['common_wood', 'common_wood', 'common_leather'], ['WOODMINT_0', 'WOODT3MINT_0', 'LEATHERMINT_0']);
     seedEnqueueMocks(3);
 
     const res = await post(body);
@@ -603,7 +627,7 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     // Change keeps the T3 token's tier and asset lineage.
     expect(ordLock).toHaveBeenCalledWith(
       'USERKEY',
-      'BATCHTX_1',
+      'WOODT3MINT_0',
       expect.objectContaining({ lootTableId: 'common_wood', tier: 3 }),
       'transfer',
       2,
@@ -667,16 +691,20 @@ describe('POST /api/crafting/mint-and-transfer', () => {
       { sourceTXID: 'PIXIETX', sourceOutputIndex: 0 },
       { sourceTXID: 'CRYSTALTX', sourceOutputIndex: 0 },
     ];
-    const seedElixirBatch = (amts = [3, 2, 1], inputs = elixirInputs, lootIds = ['ectoplasm', 'pixie_dust', 'spirit_crystal']) =>
-      seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1', 'LOCK_PS_MARKER_2'], inputs, amts, lootIds);
+    const seedElixirBatch = (
+      amts = [3, 2, 1],
+      inputs = elixirInputs,
+      lootIds = ['ectoplasm', 'pixie_dust', 'spirit_crystal'],
+      assetIds = ['ECTOMINT_0', 'PIXIEMINT_0', 'CRYSTALMINT_0'],
+    ) => seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1', 'LOCK_PS_MARKER_2'], inputs, amts, lootIds, assetIds);
     const itemClaimId = () => inventoryUpdateMany.mock.calls[0][1].$set.pendingClaim as string;
 
     beforeEach(() => {
       playerLevel = 4;
-      ownedTokens[ECTO] = { lootTableId: 'ectoplasm', tokenId: 'ECTOTX.0', quantity: 3, tier: 1 };
-      ownedTokens[PIXIE] = { lootTableId: 'pixie_dust', tokenId: 'PIXIETX.0', quantity: 2, tier: 1 };
-      ownedItems[CRYSTAL] = { lootTableId: 'spirit_crystal', tokenId: 'CRYSTALTX.0' };
-      ownedItems[CRYSTAL_2] = { lootTableId: 'spirit_crystal', tokenId: 'CRYSTAL2TX.0' };
+      ownedTokens[ECTO] = { lootTableId: 'ectoplasm', tokenId: 'ECTOTX.0', quantity: 3, tier: 1, mintOutpoint: 'ECTOMINT.0' };
+      ownedTokens[PIXIE] = { lootTableId: 'pixie_dust', tokenId: 'PIXIETX.0', quantity: 2, tier: 1, mintOutpoint: 'PIXIEMINT.0' };
+      ownedItems[CRYSTAL] = { lootTableId: 'spirit_crystal', tokenId: 'CRYSTALTX.0', mintOutpoint: 'CRYSTALMINT.0' };
+      ownedItems[CRYSTAL_2] = { lootTableId: 'spirit_crystal', tokenId: 'CRYSTAL2TX.0', mintOutpoint: 'CRYSTAL2MINT.0' };
     });
 
     it('400 without the artifact the recipe requires', async () => {
@@ -761,6 +789,14 @@ describe('POST /api/crafting/mint-and-transfer', () => {
       const res = await post(elixirBody);
       expect(res.status).toBe(400);
       expect(res.body).toEqual({ error: 'Item spirit_crystal transfer is inscribed as soul_stone' });
+      expectNotClaimed();
+    });
+
+    it('400 when the artifact transfer names another asset id than its mint', async () => {
+      seedElixirBatch(undefined, undefined, undefined, ['ECTOMINT_0', 'PIXIEMINT_0', 'CRYSTAL2MINT_0']);
+      const res = await post(elixirBody);
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'Item spirit_crystal transfer names asset CRYSTAL2MINT_0, not its mint CRYSTALMINT_0' });
       expectNotClaimed();
     });
 

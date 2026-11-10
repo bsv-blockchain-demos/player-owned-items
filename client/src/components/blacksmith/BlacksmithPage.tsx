@@ -27,6 +27,7 @@ interface InventoryItem {
   isMinted?: boolean;
   nftLootId?: string;
   tokenId?: string;
+  mintOutpoint?: string;
   transactionId?: string;
   keyId?: string;
   counterparty?: string;
@@ -75,6 +76,7 @@ export default function BlacksmithPage() {
           isMinted: item.isMinted,
           nftLootId: item.nftLootId,
           tokenId: item.currentTokenId || item.tokenId,
+          mintOutpoint: item.mintOutpoint,
           transactionId: item.mintTransactionId || item.transactionId,
           keyId: item.keyId,
           counterparty: item.counterparty,
@@ -170,6 +172,7 @@ export default function BlacksmithPage() {
             inventoryItemId: selectedEquipment._id,
             nftLootId: selectedEquipment.nftLootId!,
             tokenId: selectedEquipment.tokenId!,
+            mintOutpoint: selectedEquipment.mintOutpoint,
             transactionId: selectedEquipment.transactionId!,
             lootTableId: selectedEquipment.lootTableId,
             name: equipmentData.name,
@@ -201,6 +204,7 @@ export default function BlacksmithPage() {
             inventoryItemId: selectedScroll._id,
             nftLootId: selectedScroll.nftLootId!,
             tokenId: selectedScroll.tokenId!,
+            mintOutpoint: selectedScroll.mintOutpoint,
             transactionId: selectedScroll.transactionId!,
             lootTableId: selectedScroll.lootTableId,
             name: scrollData.name,

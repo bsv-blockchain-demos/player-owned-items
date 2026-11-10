@@ -44,6 +44,7 @@ export interface MaterialTokenUpdate {
   rarity: 'common' | 'rare' | 'epic' | 'legendary';
   tier?: number;                 // Material tier (if applicable)
   currentTokenId: string;        // Current token ID on blockchain
+  mintOutpoint?: string;         // The stack's BSV-21 id, carried by every transfer
   currentQuantity: number;       // Current quantity (for validation)
   keyId?: string;                // Derivation nonce used to lock this token (absent = legacy)
   counterparty?: string;         // Counterparty used to lock this token (absent = legacy)
@@ -148,7 +149,9 @@ export function useUpdateMaterialToken() {
           const transferNonce = generateNonce();
           const serverKey = await deriveRecipientKey(wallet, serverIdentityKey, transferNonce);
 
-          const assetId = update.currentTokenId.replace('.', '_');
+          // The server rejects a transfer without the stack's mint id, and only after it broadcasts.
+          if (!update.mintOutpoint) throw new Error(`${update.itemName} has no recorded mint and cannot be merged`);
+          const assetId = update.mintOutpoint.replace('.', '_');
           const transferLockingScript = ordinalP2PKH.lock(
             serverKey,
             assetId,

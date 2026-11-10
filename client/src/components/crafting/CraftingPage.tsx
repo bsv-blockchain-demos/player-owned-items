@@ -29,6 +29,7 @@ interface MaterialItem {
   quantity: number;
   isMinted: boolean;
   tokenId?: string;
+  mintOutpoint?: string;
   transactionId?: string;
   isMaterialToken: boolean;
   keyId?: string;
@@ -89,6 +90,7 @@ export default function CraftingPage() {
               quantity: item.quantity || 1,
               isMinted: item.isMinted || false,
               tokenId: item.tokenId,
+              mintOutpoint: item.mintOutpoint,
               transactionId: item.transactionId,
               isMaterialToken: item.isMaterialToken || false,
               keyId: item.keyId,
@@ -201,6 +203,7 @@ export default function CraftingPage() {
           inventoryItemId: material.inventoryId,
           nftLootId: material.materialTokenId,
           tokenId: material.tokenId!,
+          mintOutpoint: material.mintOutpoint,
           transactionId: material.transactionId!,
           name: material.name,
           rarity: lootItem?.rarity || 'common',

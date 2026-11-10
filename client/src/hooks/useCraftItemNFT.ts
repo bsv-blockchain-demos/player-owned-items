@@ -23,6 +23,7 @@ export interface CraftingInputItem {
   inventoryItemId: string;
   nftLootId?: string;
   tokenId?: string;
+  mintOutpoint?: string; // BSV-21 id of the token, carried by every transfer
   transactionId?: string;
   name: string;
   rarity: string;
@@ -130,6 +131,9 @@ export function useCraftItemNFT() {
 
       const ordinalP2PKH = new OrdinalsP2PKH();
       const batchInputs = craftBatch(inputItems);
+      // The server rejects a transfer without the token's mint id, and only after this batch broadcasts.
+      const unminted = batchInputs.find((input) => !input.mintOutpoint);
+      if (unminted) throw new Error(`${unminted.name} has no recorded mint and cannot be transferred`);
 
       // Per-input unlock: each token has its own stored derivation (legacy fallback when absent)
       const buildUnlock = (m: { keyId?: string; counterparty?: string }) =>
@@ -162,7 +166,7 @@ export function useCraftItemNFT() {
 
       // Material tokens move their whole quantity; item NFTs are amount 1.
       const outputs = batchInputs.map((input) => {
-        const assetId = input.tokenId!.replace('.', '_');
+        const assetId = input.mintOutpoint!.replace('.', '_');
         const lockingScript = isMaterialInput(input)
           ? ordinalP2PKH.lock(
               serverKey,

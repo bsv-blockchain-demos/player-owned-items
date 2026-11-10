@@ -106,15 +106,3 @@ export function voutOf(outpoint: string, txid: string): number | null {
   if (rest.length || id !== txid || !/^(0|[1-9]\d*)$/.test(vout ?? '')) return null;
   return Number(vout);
 }
-
-/** The amount of an OrdinalsP2PKH bsv-20 transfer inscription, or null if the script carries none. */
-export function transferAmount(script: { chunks: Array<{ data?: number[] }> }): number | null {
-  const [, , marker, , , , body] = script.chunks;
-  if (!marker?.data || !body?.data || Buffer.from(marker.data).toString('utf8') !== 'ord') return null;
-  try {
-    const inscription = JSON.parse(Buffer.from(body.data).toString('utf8'));
-    return inscription?.op === 'transfer' && Number.isInteger(inscription.amt) ? inscription.amt : null;
-  } catch {
-    return null;
-  }
-}

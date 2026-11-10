@@ -1,12 +1,12 @@
 // Checks a client batch transfer (posted as BEEF) before the server spends its outputs:
 // each named outpoint must be an output of that tx, locked to the server key derived
 // from the client's nonce N2, spending the owned token it stands for, with the amount expected,
-// and inscribed with the same lootTableId as the owned DB doc.
+// and inscribed with the owned DB doc's lootTableId and BSV-21 asset id (its mint outpoint).
 import { P2PKH, Hash, type Transaction, type WalletInterface } from '@bsv/sdk';
 import { TOKEN_PROTOCOL } from '@shared/tokenDerivation';
 import { getServerPublicKey } from '@server/lib/serverWallet';
-import { voutOf, transferAmount } from '@server/lib/materialUnits';
-import { inscribedLootTableId } from '@server/lib/tokenScript';
+import { voutOf } from '@server/lib/materialUnits';
+import { transferAmount, inscribedLootTableId, inscribedAssetId, mintAssetId } from '@server/lib/tokenScript';
 
 /** Hex every transferred output's locking script must contain: P2PKH of the server key derived from N2. */
 export async function serverLockPattern(
@@ -28,6 +28,7 @@ export interface ExpectedTransfer {
   amount: number;
   amountRule: string; // e.g. "must carry amount 1"
   lootTableId: string; // the owned DB doc's; the output's metadata must name the same
+  mintOutpoint: string | undefined; // the owned DB doc's; the inscription's id must be its asset id
 }
 
 /** The first reason the batch doesn't move each owned token whole to the server, or null. */
@@ -40,6 +41,8 @@ export function checkBatchTransfer(
   const spent = new Set(tx.inputs.map((i) => `${i.sourceTXID || i.sourceTransaction?.id('hex')}.${i.sourceOutputIndex}`));
   const seen = new Set<string>();
   for (const e of expected) {
+    const assetId = mintAssetId(e.mintOutpoint);
+    if (!assetId) return { status: 400, error: `${e.label} has no recorded mint` };
     const vout = voutOf(e.tokenId, txid);
     if (vout === null) return { status: 400, error: `Transfer outpoint not in batch transfer: ${e.tokenId}` };
     if (seen.has(e.tokenId)) return { status: 400, error: `Transfer outpoint used twice: ${e.tokenId}` };
@@ -52,6 +55,8 @@ export function checkBatchTransfer(
     if (transferAmount(output.lockingScript) !== e.amount) return { status: 400, error: `${e.label} transfer ${e.amountRule}` };
     const inscribed = inscribedLootTableId(output.lockingScript);
     if (inscribed !== e.lootTableId) return { status: 400, error: `${e.label} transfer is inscribed as ${inscribed ?? 'no lootTableId'}` };
+    const named = inscribedAssetId(output.lockingScript);
+    if (named !== assetId) return { status: 400, error: `${e.label} transfer names asset ${named ?? 'none'}, not its mint ${assetId}` };
   }
   return null;
 }

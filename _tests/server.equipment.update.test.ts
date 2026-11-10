@@ -91,8 +91,8 @@ const defaultDocs = (): Record<string, any> => ({
     tokenId: 'ORIGTX.0', mintOutpoint: 'ORIGMINT.0', borderGradient: gradient, crafted: true, statRoll: 1.1,
     rolledStats: { damageBonus: 1 }, isEmpowered: true,
   },
-  [SCROLL_P]: { userId: 'u1', lootTableId: 'prefix_damage_common', itemType: 'inscription_scroll', tier: 1, nftLootId: new ObjectId(), tokenId: 'SCROLLPTX.0' },
-  [SCROLL_S]: { userId: 'u1', lootTableId: 'suffix_damage_common', itemType: 'inscription_scroll', tier: 1, nftLootId: new ObjectId(), tokenId: 'SCROLLSTX.0' },
+  [SCROLL_P]: { userId: 'u1', lootTableId: 'prefix_damage_common', itemType: 'inscription_scroll', tier: 1, nftLootId: new ObjectId(), tokenId: 'SCROLLPTX.0', mintOutpoint: 'SCROLLPMINT.0' },
+  [SCROLL_S]: { userId: 'u1', lootTableId: 'suffix_damage_common', itemType: 'inscription_scroll', tier: 1, nftLootId: new ObjectId(), tokenId: 'SCROLLSTX.0', mintOutpoint: 'SCROLLSMINT.0' },
 });
 
 // equipmentData / updatedPrefix / updatedSuffix are FORGED to prove the server ignores them.
@@ -111,7 +111,7 @@ const validBody = {
   walletParams: { protocolID: [0, 'x'], keyID: '1', counterparty: 'cp' },
 };
 
-const inscribed = (hex: string, amt: number, lootTableId: string) => inscribedScript(hex, amt, { lootTableId });
+const inscribed = (hex: string, amt: number, lootTableId: string, assetId: string) => inscribedScript(hex, amt, { lootTableId }, assetId);
 const defaultInputs = [
   { sourceTXID: 'ORIGTX', sourceOutputIndex: 0 },
   { sourceTXID: 'SCROLLPTX', sourceOutputIndex: 0 },
@@ -124,13 +124,14 @@ function seedPaymentAndBatchMocks(
   inputs = defaultInputs,
   amts = [1, 1, 1],
   lootIds = ['common_dagger', 'prefix_damage_common', 'suffix_damage_common'],
+  assetIds = ['ORIGMINT_0', 'SCROLLPMINT_0', 'SCROLLSMINT_0'],
 ) {
   (Transaction.fromBEEF as jest.Mock)
     .mockReturnValueOnce({ id: () => 'PAYTXID', outputs: [{ satoshis: 100 }], toBEEF: () => [3, 3] })
     .mockReturnValueOnce({
       id: () => 'BATCHTX',
       inputs,
-      outputs: scripts.map((hex, i) => ({ lockingScript: inscribed(hex, amts[i], lootIds[i]) })),
+      outputs: scripts.map((hex, i) => ({ lockingScript: inscribed(hex, amts[i], lootIds[i], assetIds[i]) })),
       toBEEF: () => [1, 1],
     });
 }
@@ -314,6 +315,23 @@ describe('POST /api/equipment/update', () => {
     expectNotClaimed();
   });
 
+  it('400 when the equipment transfer names another asset id than its mint', async () => {
+    seedPaymentAndBatchMocks(undefined, undefined, undefined, undefined, ['ORIGTX_0', 'SCROLLPMINT_0', 'SCROLLSMINT_0']);
+    const res = await post(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Equipment common_dagger transfer names asset ORIGTX_0, not its mint ORIGMINT_0' });
+    expectNotClaimed();
+  });
+
+  it('400 when a scroll has no recorded mint', async () => {
+    delete ownedDocs[SCROLL_P].mintOutpoint;
+    seedPaymentAndBatchMocks();
+    const res = await post(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Scroll prefix_damage_common has no recorded mint' });
+    expectNotClaimed();
+  });
+
   it('400 when two entries name the same transfer outpoint', async () => {
     seedPaymentAndBatchMocks();
     const res = await post({ ...validBody, transferredScrollTokenIds: ['BATCHTX.1', 'BATCHTX.1'] });
@@ -373,7 +391,8 @@ describe('POST /api/equipment/update', () => {
 
     const prefix = { type: 'damage', value: 3, name: 'Savage' };
     const suffix = { type: 'damage', value: 3, name: 'of Fury' };
-    expect(ordLock).toHaveBeenCalledWith('USERKEY', 'ORIGTX_0', {
+    // The re-minted output keeps the item's BSV-21 id (its mint), not its current outpoint.
+    expect(ordLock).toHaveBeenCalledWith('USERKEY', 'ORIGMINT_0', {
       name: 'game_item',
       itemName: 'Rusty Dagger',
       description: 'A worn but functional blade',

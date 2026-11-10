@@ -24,6 +24,7 @@ import { TOKEN_PROTOCOL, generateNonce, deriveRecipientKey } from '@shared/token
 import { getLootItemById } from '@shared/loot-table';
 import { EQUIPMENT_SLOTS, type Inscription, type InscriptionData, type UserInventory } from '@shared/types';
 import { serverLockPattern, checkBatchTransfer } from '@server/lib/batchTransfer';
+import { mintAssetId } from '@server/lib/tokenScript';
 import { EXCLUSIVE_INSCRIPTION_TYPES } from '@shared/inscriptions';
 import {
   parseInventoryIds,
@@ -184,6 +185,7 @@ equipmentRouter.post('/update', requireAuthProof('update-equipment'), async (req
       amount: 1,
       amountRule: 'must carry amount 1',
       lootTableId: doc.lootTableId,
+      mintOutpoint: doc.mintOutpoint,
     })),
   );
   if (transferFailure) {
@@ -216,7 +218,7 @@ equipmentRouter.post('/update', requireAuthProof('update-equipment'), async (req
     visual: { borderGradient: originalEquipment.borderGradient },
   };
 
-  const assetId = originalEquipment.tokenId!.replace('.', '_');
+  const assetId = mintAssetId(originalEquipment.mintOutpoint)!; // checked by checkBatchTransfer
 
   // Obtained before claiming so a queue failure can't strand the claim.
   const queue = await getWalletQueue();
@@ -343,8 +345,7 @@ equipmentRouter.post('/update', requireAuthProof('update-equipment'), async (req
   let newInventoryItemId: string | undefined;
   let wasEquipped = false;
   try {
-    const originalNFTLoot = await nftLootCollection.findOne({ _id: originalEquipment.nftLootId });
-    const mintOutpoint = originalNFTLoot?.mintOutpoint ?? originalEquipment.mintOutpoint; // preserve original mint proof
+    const mintOutpoint = originalEquipment.mintOutpoint; // the item's BSV-21 id carries over
 
     // Carries keyId/counterparty for wallet internalization (not on the NFTLoot type).
     const updatedNftLootDoc = {

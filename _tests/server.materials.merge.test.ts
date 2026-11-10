@@ -42,9 +42,10 @@ jest.mock('@shared/tokenDerivation', () => ({
   deriveRecipientKey: jest.fn(async () => 'USERKEY'),
   deriveSelfKey: jest.fn(async () => 'MINTKEY'),
 }));
+const ordLock = jest.fn((..._args: unknown[]) => ({ toHex: () => 'LOCKHEX' }));
 jest.mock('@shared/ordinalP2PKH', () => ({
   OrdinalsP2PKH: class {
-    lock() { return { toHex: () => 'LOCKHEX' }; }
+    lock(...args: unknown[]) { return ordLock(...args); }
     unlock() { return { estimateLength: async () => 100 }; }
   },
 }));
@@ -94,9 +95,9 @@ const validBody = {
 };
 
 const EXISTING_OID = new ObjectId('64b0000000000000000000aa');
-const ownedToken = { _id: EXISTING_OID, lootTableId: 'phoenix_feather', tier: 1, quantity: 5, tokenId: 'USERTOKEN.0' };
+const ownedToken = { _id: EXISTING_OID, lootTableId: 'phoenix_feather', tier: 1, quantity: 5, tokenId: 'USERTOKEN.0', mintOutpoint: 'STACKMINT.0' };
 
-const inscribed = (hex: string, amt: number, lootTableId: string) => inscribedScript(hex, amt, { lootTableId });
+const inscribed = (hex: string, amt: number, lootTableId: string, assetId: string) => inscribedScript(hex, amt, { lootTableId }, assetId);
 
 /** payment tx + transfer tx — reached by every request past field validation. */
 function seedPaymentAndTransferMocks(
@@ -104,13 +105,14 @@ function seedPaymentAndTransferMocks(
   inputs = [{ sourceTXID: 'USERTOKEN', sourceOutputIndex: 0 }],
   amt = 5,
   lootTableId = 'phoenix_feather',
+  assetId = 'STACKMINT_0',
 ) {
   (Transaction.fromBEEF as jest.Mock)
     .mockReturnValueOnce({ id: () => 'PAYTXID', outputs: [{ satoshis: 100 }] })
     .mockReturnValueOnce({
       id: () => 'TXID1',
       inputs,
-      outputs: [{ lockingScript: inscribed(transferScriptHex, amt, lootTableId) }],
+      outputs: [{ lockingScript: inscribed(transferScriptHex, amt, lootTableId, assetId) }],
       toBEEF: () => [1, 1],
     });
 }
@@ -271,6 +273,14 @@ describe('POST /api/materials/add-and-merge', () => {
     expect(enqueue).not.toHaveBeenCalled();
   });
 
+  it('400 when the transfer names another asset id than the stack\'s mint', async () => {
+    seedPaymentAndTransferMocks('LOCKSCRIPT_CONTAINS_PS_MARKER', undefined, 5, undefined, 'USERTOKEN_0');
+    const res = await request(buildApp()).post('/api/materials/add-and-merge').send(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Transfer names asset USERTOKEN_0, not the stack\'s mint STACKMINT_0' });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
   it('400 when the transfer is inscribed as another material than the owned token', async () => {
     seedPaymentAndTransferMocks('LOCKSCRIPT_CONTAINS_PS_MARKER', undefined, 5, 'common_wood');
     const res = await request(buildApp()).post('/api/materials/add-and-merge').send(validBody);
@@ -373,6 +383,8 @@ describe('POST /api/materials/add-and-merge', () => {
 
     // Both dependent wallet actions ran as ONE unit through the serialized queue.
     expect(enqueue).toHaveBeenCalledWith('merge:material', expect.any(Function));
+    // The merged output keeps the existing stack's BSV-21 id; the new mint's units join it.
+    expect(ordLock).toHaveBeenLastCalledWith('USERKEY', 'STACKMINT_0', expect.anything(), 'transfer', expect.any(Number));
     expect(stubWallet.createAction).toHaveBeenCalledTimes(2);
     expect(stubWallet.signAction).toHaveBeenCalledTimes(2);
 

@@ -22,6 +22,7 @@ export interface EquipmentNFTItem {
   inventoryItemId: string;
   nftLootId: string;
   tokenId: string;
+  mintOutpoint?: string; // BSV-21 id of the token, carried by every transfer
   transactionId: string;
   lootTableId: string;
   name: string;
@@ -57,6 +58,7 @@ export interface InscriptionScrollItem {
   inventoryItemId: string;
   nftLootId: string;
   tokenId: string;
+  mintOutpoint?: string;
   transactionId: string;
   lootTableId: string;
   name: string;
@@ -133,6 +135,9 @@ export function useUpdateEquipmentNFT() {
 
       const ordinalP2PKH = new OrdinalsP2PKH();
       const allItems = [equipmentItem, ...inscriptionScrolls];
+      // The server rejects a transfer without the token's mint id, and only after this batch broadcasts.
+      const unminted = allItems.find((item) => !item.mintOutpoint);
+      if (unminted) throw new Error(`${unminted.name} has no recorded mint and cannot be transferred`);
 
       // Per-input unlock: each token has its own stored derivation (legacy fallback when absent)
       const buildUnlock = (item: { keyId?: string; counterparty?: string }) =>
@@ -164,7 +169,7 @@ export function useUpdateEquipmentNFT() {
       const serverKey = await deriveRecipientKey(wallet, serverIdentityKey, transferNonce);
 
       // Equipment output (index 0)
-      const equipmentAssetId = equipmentItem.tokenId.replace('.', '_');
+      const equipmentAssetId = equipmentItem.mintOutpoint!.replace('.', '_');
       const equipmentLockingScript = ordinalP2PKH.lock(
         serverKey,
         equipmentAssetId,
@@ -193,7 +198,7 @@ export function useUpdateEquipmentNFT() {
 
       // Scroll outputs (indices 1+), all locked to the same serverKey
       for (const scroll of inscriptionScrolls) {
-        const scrollAssetId = scroll.tokenId.replace('.', '_');
+        const scrollAssetId = scroll.mintOutpoint!.replace('.', '_');
         const scrollLockingScript = ordinalP2PKH.lock(
           serverKey,
           scrollAssetId,

@@ -125,11 +125,8 @@ inventoryRouter.get('/get', requireSession, async (req: Request, res: Response) 
             // Extract txid from mintOutpoint (format: "txid.vout")
             item.mintTransactionId = nftLoot.mintOutpoint?.split('.')[0];
 
-            // Ensure mintOutpoint is always present for minted items.
-            // Older records may not have had mintOutpoint copied onto UserInventory.
-            if (!item.mintOutpoint && nftLoot.mintOutpoint) {
-              item.mintOutpoint = nftLoot.mintOutpoint;
-            }
+            // mintOutpoint stays the doc's own: it is the token's BSV-21 id, and transfers are
+            // checked against the doc. A legacy doc without one must not look transferable.
 
             // Current location: the inventory doc is canonical (a purchase moves only it), NFTLoot is the fallback.
             item.tokenId = item.tokenId ?? nftLoot.tokenId;

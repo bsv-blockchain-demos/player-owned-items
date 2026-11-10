@@ -18,6 +18,7 @@ import { getWalletQueue } from '@server/lib/walletQueue';
 import { connectToMongo, getClient } from '@server/lib/mongodb';
 import { getServerWallet, getServerIdentityPublicKey } from '@server/lib/serverWallet';
 import { serverLockPattern, checkBatchTransfer } from '@server/lib/batchTransfer';
+import { mintAssetId } from '@server/lib/tokenScript';
 import { OrdinalsP2PKH } from '@shared/ordinalP2PKH';
 import { broadcastTX } from '@shared/overlayFunctions';
 import { decodeBeef, encodeBeef } from '@shared/beefEncoding';
@@ -201,6 +202,7 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
     tokenId: transfer.tokenId, // outpoint in the batch transfer tx
     docId: ownedItems[i]._id,
     ownedTokenId: ownedItems[i].tokenId!, // outpoint the batch transfer must spend
+    mintOutpoint: ownedItems[i].mintOutpoint,
   }));
 
   for (const [lootTableId, needed] of requiredQuantities) {
@@ -223,6 +225,7 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
       tokenId: transfer.tokenId, // outpoint in the batch transfer tx
       docId: owned._id,
       ownedTokenId: owned.tokenId, // outpoint the batch transfer must spend
+      mintOutpoint: owned.mintOutpoint, // the token's BSV-21 id, kept by its change
       quantity: owned.quantity,
       changeAmount: owned.quantity - used,
       itemName: loot?.name ?? transfer.lootTableId,
@@ -276,6 +279,7 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
         amount: m.quantity,
         amountRule: `must carry the full token quantity (${m.quantity})`,
         lootTableId: m.lootTableId,
+        mintOutpoint: m.mintOutpoint,
       })),
       ...items.map((t) => ({
         label: `Item ${t.lootTableId}`,
@@ -284,6 +288,7 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
         amount: 1,
         amountRule: 'must carry amount 1',
         lootTableId: t.lootTableId,
+        mintOutpoint: t.mintOutpoint,
       })),
     ],
   );
@@ -465,7 +470,7 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
       const changeNonce = generateNonce();
       changeNonces.push(changeNonce);
       const changeKey = await deriveRecipientKey(serverWallet, userIdentityKey, changeNonce);
-      const changeAssetId = change.tokenId.replace('.', '_');
+      const changeAssetId = mintAssetId(change.mintOutpoint)!; // checked by checkBatchTransfer
       transferOutputs.push({
         outputDescription: `Material change: ${change.lootTableId}`,
         lockingScript: ordinalP2PKH.lock(

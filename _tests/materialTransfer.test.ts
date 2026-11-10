@@ -2,8 +2,8 @@
 // transferAmount to the layout the SDK actually produces.
 import { PrivateKey, LockingScript } from '@bsv/sdk';
 import { OrdinalsP2PKH } from '@shared/ordinalP2PKH';
-import { transferAmount, voutOf } from '@server/lib/materialUnits';
-import { tokenMetadata } from '@server/lib/tokenScript';
+import { voutOf } from '@server/lib/materialUnits';
+import { tokenMetadata, transferAmount, inscribedAssetId, mintAssetId } from '@server/lib/tokenScript';
 
 const pubKey = PrivateKey.fromRandom().toPublicKey().toString();
 const metadata = { name: 'material_token', lootTableId: 'common_wood', tier: 1 };
@@ -65,5 +65,27 @@ describe('tokenMetadata', () => {
     // OP_RETURN + one push, the shape the SDK parses into a single raw-remainder chunk
     const hex = '6a' + data.length.toString(16).padStart(2, '0') + data.toString('hex');
     expect(tokenMetadata(LockingScript.fromHex(hex))).toBeNull();
+  });
+});
+
+describe('inscribedAssetId', () => {
+  it('reads the id of a transfer inscription', () => {
+    const script = new OrdinalsP2PKH().lock(pubKey, 'MINTTX_0', metadata, 'transfer', 7);
+    expect(inscribedAssetId(parsed(script))).toBe('MINTTX_0');
+  });
+
+  it('returns null for a deploy+mint (it has no id)', () => {
+    const script = new OrdinalsP2PKH().lock(pubKey, '', metadata, 'deploy+mint', 7);
+    expect(inscribedAssetId(parsed(script))).toBeNull();
+  });
+});
+
+describe('mintAssetId', () => {
+  it('is the BSV-21 id form of the mint outpoint', () => {
+    expect(mintAssetId('abc.0')).toBe('abc_0');
+  });
+
+  it('is null without a recorded mint', () => {
+    expect(mintAssetId(undefined)).toBeNull();
   });
 });

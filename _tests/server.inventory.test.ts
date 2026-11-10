@@ -152,6 +152,9 @@ describe('GET /api/inventory/get', () => {
       .get('/api/inventory/get')
       .set('Cookie', await authCookie());
 
-    expect(res.body.inventory[0]).toEqual(expect.objectContaining({ tokenId: 'BUYERTX.0', currentTokenId: 'BUYERTX.0', mintOutpoint: 'MINT.0' }));
+    expect(res.body.inventory[0]).toEqual(expect.objectContaining({ tokenId: 'BUYERTX.0', currentTokenId: 'BUYERTX.0' }));
+    // Only the doc's own mintOutpoint is the token's id; transfers are checked against it, so no NFTLoot fallback.
+    expect(res.body.inventory[0].mintOutpoint).toBeUndefined();
+    expect(res.body.inventory[0].mintTransactionId).toBe('MINT');
   });
 });
