@@ -7,6 +7,7 @@ import { requireAuthProof } from '@server/middleware/requireAuthProof';
 import { ObjectId } from 'mongodb';
 import { getLootItemById } from '@shared/loot-table';
 import { Inscription } from '@shared/types';
+import { inscriptionGoldCost } from '@shared/inscriptions';
 
 export const inscriptionsRouter = Router();
 
@@ -121,14 +122,7 @@ inscriptionsRouter.post('/apply', requireAuthProof('inscribe'), async (req: Requ
       }
     }
 
-    // Calculate gold cost based on scroll rarity
-    const goldCosts: Record<string, number> = {
-      common: 250,
-      rare: 1000,
-      epic: 2500,
-      legendary: 5000
-    };
-    const goldCost = goldCosts[scrollTemplate.rarity] || 250;
+    const goldCost = inscriptionGoldCost(scrollTemplate.rarity);
 
     // Check if player has enough gold
     if (playerStats.coins < goldCost) {

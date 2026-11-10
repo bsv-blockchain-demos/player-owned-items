@@ -1,4 +1,4 @@
-import { inscriptionConflict } from '@shared/inscriptions';
+import { inscriptionConflict, inscriptionGoldCost } from '@shared/inscriptions';
 import type { InscriptionData } from '@shared/types';
 
 const scroll = (inscriptionType: InscriptionData['inscriptionType'], slot: 'prefix' | 'suffix'): InscriptionData => ({
@@ -21,5 +21,11 @@ describe('inscriptionConflict', () => {
 
   it('allows an empty item', () => {
     expect(inscriptionConflict({}, scroll('lifesteal', 'suffix'))).toBeNull();
+  });
+});
+
+describe('inscriptionGoldCost', () => {
+  it.each([['common', 250], ['rare', 1000], ['epic', 2500], ['legendary', 5000]])('%s scroll costs %i gold', (rarity, cost) => {
+    expect(inscriptionGoldCost(rarity)).toBe(cost);
   });
 });

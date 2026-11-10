@@ -384,6 +384,28 @@ describe('POST /api/equipment/update', () => {
     expect(enqueue).not.toHaveBeenCalled();
   });
 
+  it('400 and releases the claim when the player cannot pay the scrolls\' gold', async () => {
+    seedPaymentAndBatchMocks();
+    playerStatsUpdateOne.mockResolvedValueOnce({ modifiedCount: 0 }); // coins < cost
+    const res = await post(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Insufficient gold. Need 500 gold to apply these inscriptions.' });
+    expect(playerStatsUpdateOne).toHaveBeenCalledWith({ userId: 'u1', coins: { $gte: 500 } }, { $inc: { coins: -500 } });
+    expect(inventoryUpdateMany).toHaveBeenLastCalledWith({ pendingClaim: claimId() }, { $unset: { pendingClaim: '' } });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('charges each scroll\'s gold after claiming, before the wallet runs', async () => {
+    seedPaymentAndBatchMocks();
+    seedEnqueueMocks();
+    const res = await post(validBody);
+    expect(res.status).toBe(200);
+    // two common scrolls: 250 + 250
+    expect(playerStatsUpdateOne).toHaveBeenNthCalledWith(1, { userId: 'u1', coins: { $gte: 500 } }, { $inc: { coins: -500 } });
+    expect(inventoryUpdateMany.mock.invocationCallOrder[0]).toBeLessThan(playerStatsUpdateOne.mock.invocationCallOrder[0]);
+    expect(playerStatsUpdateOne.mock.invocationCallOrder[0]).toBeLessThan(enqueue.mock.invocationCallOrder[0]);
+  });
+
   it('derives the updated item from the owned docs + loot table (ignoring forged body fields)', async () => {
     seedPaymentAndBatchMocks();
     seedEnqueueMocks();
@@ -492,6 +514,7 @@ describe('POST /api/equipment/update', () => {
     expect(res.status).toBe(500);
     expect(res.body).toEqual({ error: 'Internal server error' });
     expect(inventoryUpdateMany).toHaveBeenLastCalledWith({ pendingClaim: claimId() }, { $unset: { pendingClaim: '' } });
+    expect(playerStatsUpdateOne).toHaveBeenLastCalledWith({ userId: 'u1' }, { $inc: { coins: 500 } }); // refund
     expect(nftInsertOne).not.toHaveBeenCalled();
     expect(inventoryDeleteOne).not.toHaveBeenCalled();
   });

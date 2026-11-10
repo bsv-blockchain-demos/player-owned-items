@@ -12,3 +12,8 @@ export function inscriptionConflict(
   const opposite = scroll.slot === 'prefix' ? item.suffix : item.prefix;
   return opposite?.type === scroll.inscriptionType ? scroll.inscriptionType : null;
 }
+
+const INSCRIPTION_GOLD_COST: Record<string, number> = { common: 250, rare: 1000, epic: 2500, legendary: 5000 };
+
+/** Gold to apply one scroll of this rarity, minted or not. */
+export const inscriptionGoldCost = (rarity: string): number => INSCRIPTION_GOLD_COST[rarity] ?? 250;
