@@ -13,14 +13,16 @@ import { requireAuthProof } from '@server/middleware/requireAuthProof';
 import { requireSession } from '@server/middleware/requireSession';
 import { getWalletQueue } from '@server/lib/walletQueue';
 import { connectToMongo, getClient } from '@server/lib/mongodb';
-import { getServerIdentityPublicKey } from '@server/lib/serverWallet';
+import { getServerIdentityPublicKey, getServerWallet } from '@server/lib/serverWallet';
 import { OrdinalsP2PKH } from '@shared/ordinalP2PKH';
 import { broadcastTX, getTransactionByTxID } from '@shared/overlayFunctions';
 import { decodeBeef, encodeBeef } from '@shared/beefEncoding';
 import { generateNonce, deriveRecipientKey } from '@shared/tokenDerivation';
 import { getLootItemById, type LootItem, type EquipmentStats } from '@shared/loot-table';
 import { EQUIPMENT_SLOTS, type MarketplaceItem } from '@shared/types';
-import { TOKEN_CLAIM_FAILED } from '@server/lib/materialUnits';
+import { TOKEN_CLAIM_FAILED, voutOf } from '@server/lib/materialUnits';
+import { lockPatternFor, inputOutpoint, strayAssetOutput } from '@server/lib/batchTransfer';
+import { transferAmount, inscribedLootTableId, inscribedAssetId } from '@server/lib/tokenScript';
 
 export const marketplaceRouter = Router();
 
@@ -963,11 +965,12 @@ marketplaceRouter.post('/cancel-listing', requireAuthProof('cancel'), async (req
     const userId = req.userId as string;
     const body = req.body;
 
-    const { listingId, returnTokenId, cancelBeef, keyId, counterparty } = body;
+    // counterparty is not read: the return key is always derived against the server identity key.
+    const { listingId, returnTokenId, cancelBeef, keyId } = body;
 
     // Validate required fields
-    if (!listingId || !returnTokenId) {
-      res.status(400).json({ error: 'Missing required fields: listingId, returnTokenId' });
+    if (!listingId || typeof returnTokenId !== 'string' || typeof keyId !== 'string' || !keyId) {
+      res.status(400).json({ error: 'Missing required fields: listingId, returnTokenId, keyId' });
       return;
     }
 
@@ -996,13 +999,6 @@ marketplaceRouter.post('/cancel-listing', requireAuthProof('cancel'), async (req
       return;
     }
 
-    const [cancelTxId, returnVoutStr] = String(returnTokenId).split('.');
-    const returnVout = parseInt(returnVoutStr, 10);
-    if (!cancelTxId || Number.isNaN(returnVout)) {
-      res.status(400).json({ error: 'Invalid returnTokenId format' });
-      return;
-    }
-
     // Validate from the client-posted BEEF
     if (!cancelBeef) {
       res.status(400).json({ error: 'Missing cancelBeef' });
@@ -1020,15 +1016,60 @@ marketplaceRouter.post('/cancel-listing', requireAuthProof('cancel'), async (req
       return;
     }
 
+    const returnVout = voutOf(returnTokenId, cancelTx.id('hex'));
+    if (returnVout === null) {
+      res.status(400).json({ error: 'returnTokenId is not an output of the cancel transaction' });
+      return;
+    }
+
+    // Input i carries output i: the return output's own input must be the one releasing the OrdLock.
+    const pairedInput = cancelTx.inputs[returnVout];
+    if (!pairedInput || inputOutpoint(pairedInput) !== listing.ordLockOutpoint) {
+      res.status(400).json({ error: 'Return output is not paired with the listing ordLockOutpoint input' });
+      return;
+    }
+
     const output = cancelTx.outputs[returnVout];
     if (!output || (output.satoshis || 0) !== 1) {
       res.status(400).json({ error: 'Cancel transaction return output must be 1 satoshi' });
       return;
     }
 
-    // Update marketplace listing status
-    await marketplaceItemsCollection.updateOne(
-      { _id: new ObjectId(listingId) },
+    // The seller derived the return key as (server identity, keyId); BRC-42 gives the server the same key.
+    const serverIdentityKey = await getServerIdentityPublicKey();
+    const sellerKey = await deriveRecipientKey(await getServerWallet(), userId, keyId);
+    if (!output.lockingScript.toHex().includes(lockPatternFor(sellerKey))) {
+      res.status(400).json({ error: 'Return output is not locked to the seller' });
+      return;
+    }
+
+    const listedAmount = listing.materialTokenId ? (listing.quantity ?? 0) : 1;
+    if (transferAmount(output.lockingScript) !== listedAmount) {
+      res.status(400).json({ error: `Return output must carry the listed amount (${listedAmount})` });
+      return;
+    }
+
+    const inscribed = inscribedLootTableId(output.lockingScript);
+    if (inscribed !== listing.lootTableId) {
+      res.status(400).json({ error: `Return output is inscribed as ${inscribed ?? 'no lootTableId'}` });
+      return;
+    }
+
+    // list-item set assetId from the token's mint outpoint: its BSV-21 id.
+    const namedAssetId = inscribedAssetId(output.lockingScript);
+    if (namedAssetId !== listing.assetId) {
+      res.status(400).json({ error: `Return output names asset ${namedAssetId ?? 'none'}, not the listed ${listing.assetId}` });
+      return;
+    }
+    const stray = strayAssetOutput(cancelTx, new Set([returnVout]), new Set([listing.assetId]));
+    if (stray) {
+      res.status(400).json({ error: stray });
+      return;
+    }
+
+    // Only an active listing is cancelled; a purchase may have claimed it since it was read.
+    const { modifiedCount: cancelled } = await marketplaceItemsCollection.updateOne(
+      { _id: new ObjectId(listingId), status: 'active' },
       {
         $set: {
           status: 'cancelled',
@@ -1037,49 +1078,38 @@ marketplaceRouter.post('/cancel-listing', requireAuthProof('cancel'), async (req
         }
       }
     );
+    if (cancelled !== 1) {
+      res.status(409).json({ error: 'Listing is no longer active' });
+      return;
+    }
 
     // Listing spent — drop the BEEF backup.
     await marketplaceListingBeefsCollection.deleteOne({ listingId });
 
-    // Update item tokenId in inventory or material tokens
+    // Move the item or material token from the listing's OrdLock to the returned outpoint.
+    const returned = {
+      tokenId: returnTokenId,
+      keyId,
+      counterparty: serverIdentityKey,
+      updatedAt: new Date(),
+    };
     if (listing.inventoryItemId) {
       const inv = await userInventoryCollection.findOne({ _id: new ObjectId(listing.inventoryItemId), userId });
       await userInventoryCollection.updateOne(
-        { _id: new ObjectId(listing.inventoryItemId) },
-        {
-          $set: {
-            tokenId: returnTokenId,
-            keyId,
-            counterparty,
-            updatedAt: new Date(),
-          }
-        }
+        { _id: new ObjectId(listing.inventoryItemId), userId, tokenId: listing.ordLockOutpoint },
+        { $set: returned }
       );
 
       if (inv?.nftLootId) {
         await nftLootCollection.updateOne(
           { _id: inv.nftLootId },
-          {
-            $set: {
-              tokenId: returnTokenId,
-              keyId,
-              counterparty,
-              updatedAt: new Date(),
-            }
-          }
+          { $set: returned }
         );
       }
     } else if (listing.materialTokenId) {
       await materialTokensCollection.updateOne(
-        { _id: new ObjectId(listing.materialTokenId) },
-        {
-          $set: {
-            tokenId: returnTokenId,
-            keyId,
-            counterparty,
-            updatedAt: new Date(),
-          }
-        }
+        { _id: new ObjectId(listing.materialTokenId), userId, tokenId: listing.ordLockOutpoint },
+        { $set: returned }
       );
     }
 

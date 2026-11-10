@@ -28,6 +28,11 @@ export function strayAssetOutput(tx: Transaction, named: Set<number>, assetIds: 
   return null;
 }
 
+/** Hex of the P2PKH an OrdinalsP2PKH script embeds for this key (it embeds hash160(pubkey), not the raw key). */
+export function lockPatternFor(publicKey: string): string {
+  return new P2PKH().lock(Hash.hash160(publicKey, 'hex')).toHex();
+}
+
 /** Hex every transferred output's locking script must contain: P2PKH of the server key derived from N2. */
 export async function serverLockPattern(
   serverWallet: Pick<WalletInterface, 'getPublicKey'>,
@@ -37,8 +42,7 @@ export async function serverLockPattern(
   const key = transferNonce
     ? (await serverWallet.getPublicKey({ protocolID: TOKEN_PROTOCOL, keyID: transferNonce, counterparty: userIdentityKey, forSelf: true })).publicKey
     : await getServerPublicKey(); // legacy fallback
-  // OrdinalsP2PKH embeds hash160(pubkey), not raw pubkey hex
-  return new P2PKH().lock(Hash.hash160(key, 'hex')).toHex();
+  return lockPatternFor(key);
 }
 
 export interface ExpectedTransfer {

@@ -41,7 +41,8 @@ jest.mock('@bsv/sdk', () => ({
   Transaction: { fromBEEF, fromAtomicBEEF: jest.fn() },
   PublicKey: { fromString: publicKeyFromString },
   Script: { fromHex: jest.fn() },
-  P2PKH: class {},
+  P2PKH: class { lock(hash: string) { return { toHex: () => `PKH(${hash})` }; } },
+  Hash: { hash160: (key: string) => `H160(${key})` },
   Beef: class {},
 }));
 
@@ -94,7 +95,9 @@ jest.mock('@server/lib/mongodb', () => ({
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import request from 'supertest';
+import { inscribedScript } from './helpers/ordinalScript';
 import { ObjectId } from 'mongodb';
+import { deriveRecipientKey } from '@shared/tokenDerivation';
 import { marketplaceRouter } from '@server/routes/marketplace';
 import { createJWT } from '@server/lib/jwt';
 import { authServer } from '@shared/authProof';
@@ -516,38 +519,140 @@ describe('POST /api/marketplace/cancel-listing', () => {
     expect(itemsUpdateOne).not.toHaveBeenCalled();
   });
 
-  it('200s and cancels the listing (happy path)', async () => {
-    seedValidProof();
-    itemsFindOne.mockResolvedValueOnce({
-      _id: new ObjectId(LISTING_OID),
-      sellerId: 'user-123',
-      itemName: 'Iron Sword',
-      status: 'active',
-      ordLockOutpoint: 'CANCELSRC.0',
-      ordLockScript: 'ORDSCRIPT_HEX',
-      assetId: 'ASSET1',
-    });
-    fromBEEF.mockReturnValueOnce({
-      inputs: [{ sourceTXID: 'CANCELSRC', sourceOutputIndex: 0 }],
-      outputs: [{ satoshis: 1 }],
-    });
+  // The seller derives the return key with (server, keyId); BRC-42 lets the server derive the same key.
+  const SELLER_LOCK = 'xxPKH(H160(SELLERKEY))xx';
+  const inscribed = (hex: string, amt: number, lootTableId: string, assetId: string) => inscribedScript(hex, amt, { lootTableId }, assetId);
+  const listing = (over: Record<string, unknown> = {}) => ({
+    _id: new ObjectId(LISTING_OID),
+    sellerId: 'user-123',
+    itemName: 'Iron Sword',
+    status: 'active',
+    ordLockOutpoint: 'CANCELSRC.0',
+    ordLockScript: 'ORDSCRIPT_HEX',
+    assetId: 'ASSET1',
+    inventoryItemId: INVENTORY_OID,
+    lootTableId: 'common_dagger',
+    ...over,
+  });
+  // The listing's assetId is the token's mint id (set by list-item from mintOutpoint).
+  const cancelTx = (lock = SELLER_LOCK, amt = 1, satoshis = 1, lootTableId = 'common_dagger', assetId = 'ASSET1') => ({
+    id: () => 'RETURNTX',
+    inputs: [{ sourceTXID: 'CANCELSRC', sourceOutputIndex: 0 }],
+    outputs: [{ satoshis, lockingScript: inscribed(lock, amt, lootTableId, assetId) }],
+  });
+  const send = async (body: Record<string, unknown>) =>
+    request(appWithMarketplaceRouter()).post('/api/marketplace/cancel-listing').set('Cookie', await authCookie()).send(body);
+  const fullBody = { ...cancelBody, keyId: 'CANCELNONCE', counterparty: 'FORGED_COUNTERPARTY' };
 
-    const res = await request(appWithMarketplaceRouter())
-      .post('/api/marketplace/cancel-listing')
-      .set('Cookie', await authCookie())
-      .send(cancelBody);
+  beforeEach(() => {
+    (deriveRecipientKey as jest.Mock).mockResolvedValue('SELLERKEY');
+    itemsUpdateOne.mockResolvedValue({ modifiedCount: 1 });
+    userInventoryUpdateOne.mockResolvedValue({ modifiedCount: 1 });
+  });
+
+  it('200s and returns the item to the seller key the server derives (happy path)', async () => {
+    seedValidProof();
+    itemsFindOne.mockResolvedValueOnce(listing());
+    userInventoryFindOne.mockResolvedValueOnce(null);
+    fromBEEF.mockReturnValueOnce(cancelTx());
+
+    const res = await send(fullBody);
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({
-      success: true,
-      returnTokenId: 'RETURNTX.0',
-      message: 'Iron Sword listing cancelled',
-    });
+    expect(res.body).toEqual({ success: true, returnTokenId: 'RETURNTX.0', message: 'Iron Sword listing cancelled' });
+    expect(deriveRecipientKey).toHaveBeenCalledWith(expect.anything(), 'user-123', 'CANCELNONCE');
+    // Only an active listing is cancelled, and the item moves only from the listing's OrdLock.
     expect(itemsUpdateOne).toHaveBeenCalledWith(
-      { _id: new ObjectId(LISTING_OID) },
+      { _id: new ObjectId(LISTING_OID), status: 'active' },
       expect.objectContaining({ $set: expect.objectContaining({ status: 'cancelled', tokenId: 'RETURNTX.0' }) }),
     );
+    expect(userInventoryUpdateOne).toHaveBeenCalledWith(
+      { _id: new ObjectId(INVENTORY_OID), userId: 'user-123', tokenId: 'CANCELSRC.0' },
+      { $set: expect.objectContaining({ tokenId: 'RETURNTX.0', keyId: 'CANCELNONCE', counterparty: 'SERVER_ID' }) },
+    );
     expect(beefsDeleteOne).toHaveBeenCalledWith({ listingId: LISTING_OID });
+  });
+
+  it.each([
+    ['an outpoint in another tx', { returnTokenId: 'OTHERTX.0' }, cancelTx(), 'returnTokenId is not an output of the cancel transaction'],
+    ['a non-canonical vout', { returnTokenId: 'RETURNTX.00' }, cancelTx(), 'returnTokenId is not an output of the cancel transaction'],
+    ['a return output not locked to the seller', {}, cancelTx('xxPKH(H160(SOMEONE))xx'), 'Return output is not locked to the seller'],
+    ['a return output carrying another amount', {}, cancelTx(SELLER_LOCK, 2), 'Return output must carry the listed amount (1)'],
+    ['a return output of another value', {}, cancelTx(SELLER_LOCK, 1, 5), 'Cancel transaction return output must be 1 satoshi'],
+    ['a return output inscribed as another item', {}, cancelTx(SELLER_LOCK, 1, 1, 'excalibur'), 'Return output is inscribed as excalibur'],
+    ['a return output naming another asset id', {}, cancelTx(SELLER_LOCK, 1, 1, 'common_dagger', 'OTHER_0'), 'Return output names asset OTHER_0, not the listed ASSET1'],
+  ])('400s on %s', async (_label, patch, tx, error) => {
+    seedValidProof();
+    itemsFindOne.mockResolvedValueOnce(listing());
+    fromBEEF.mockReturnValueOnce(tx);
+
+    const res = await send({ ...fullBody, ...patch });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error });
+    expect(itemsUpdateOne).not.toHaveBeenCalled();
+    expect(userInventoryUpdateOne).not.toHaveBeenCalled();
+  });
+
+  it('400s on a missing keyId (before any lookup)', async () => {
+    seedValidProof();
+    const res = await send({ ...fullBody, keyId: undefined });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Missing required fields: listingId, returnTokenId, keyId' });
+    expect(itemsFindOne).not.toHaveBeenCalled();
+  });
+
+  it('400s when the OrdLock is spent, but not by the input paired with the return output', async () => {
+    seedValidProof();
+    itemsFindOne.mockResolvedValueOnce(listing());
+    fromBEEF.mockReturnValueOnce({
+      ...cancelTx(),
+      inputs: [{ sourceTXID: 'FUNDINGTX', sourceOutputIndex: 0 }, { sourceTXID: 'CANCELSRC', sourceOutputIndex: 0 }],
+    });
+
+    const res = await send(fullBody);
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Return output is not paired with the listing ordLockOutpoint input' });
+    expect(itemsUpdateOne).not.toHaveBeenCalled();
+  });
+
+  it('400s when another output also carries the listed asset', async () => {
+    seedValidProof();
+    itemsFindOne.mockResolvedValueOnce(listing());
+    const tx = cancelTx();
+    fromBEEF.mockReturnValueOnce({ ...tx, outputs: [...tx.outputs, { satoshis: 1, lockingScript: inscribed('USER_OWN_LOCK', 1, 'common_dagger', 'ASSET1') }] });
+
+    const res = await send(fullBody);
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Output 1 also carries asset ASSET1' });
+    expect(itemsUpdateOne).not.toHaveBeenCalled();
+  });
+
+  it('checks a material listing returns its whole stack', async () => {
+    seedValidProof();
+    itemsFindOne.mockResolvedValueOnce(listing({ inventoryItemId: undefined, materialTokenId: '64b0000000000000000000ab', quantity: 4 }));
+    fromBEEF.mockReturnValueOnce(cancelTx(SELLER_LOCK, 3));
+
+    const res = await send(fullBody);
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Return output must carry the listed amount (4)' });
+  });
+
+  it('409s and writes nothing else when the listing left active (e.g. a purchase claimed it)', async () => {
+    seedValidProof();
+    itemsFindOne.mockResolvedValueOnce(listing());
+    fromBEEF.mockReturnValueOnce(cancelTx());
+    itemsUpdateOne.mockResolvedValueOnce({ modifiedCount: 0 });
+
+    const res = await send(fullBody);
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'Listing is no longer active' });
+    expect(userInventoryUpdateOne).not.toHaveBeenCalled();
+    expect(beefsDeleteOne).not.toHaveBeenCalled();
   });
 });
 
