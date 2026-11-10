@@ -117,9 +117,8 @@ function seedPaymentAndTransferMocks(
     });
 }
 
-/** The owned token is found only by the outpoint the transfer spends. */
-const findBySpentOutpoint = async (q: { tokenId?: { $in?: string[] } }) =>
-  q.tokenId?.$in?.includes(ownedToken.tokenId) ? ownedToken : null;
+/** The owned token is found only by the outpoint the input paired with the transfer output spends. */
+const findBySpentOutpoint = async (q: { tokenId?: string }) => (q.tokenId === ownedToken.tokenId ? ownedToken : null);
 
 /** The claim id the route stamped on the inventory units (first updateMany call). */
 const claimId = () => updateMany.mock.calls[0][1].$set.mintClaim as string;
@@ -246,7 +245,7 @@ describe('POST /api/materials/add-and-merge', () => {
       lootTableId: 'phoenix_feather',
       tier: 1,
       consumed: { $ne: true },
-      tokenId: { $in: ['JUNKTOKEN.0'] },
+      tokenId: 'JUNKTOKEN.0',
     });
     expect(updateMany).not.toHaveBeenCalled();
     expect(enqueue).not.toHaveBeenCalled();
@@ -270,6 +269,37 @@ describe('POST /api/materials/add-and-merge', () => {
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Transfer must carry the full token quantity (5)' });
     expect(tokenUpdateMany).not.toHaveBeenCalled();
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('404 when the owned token is spent, but not by the input paired with the transfer output', async () => {
+    // The token's input sits at index 1, the transfer output at index 0.
+    seedPaymentAndTransferMocks('LOCKSCRIPT_CONTAINS_PS_MARKER', [
+      { sourceTXID: 'FUNDINGTX', sourceOutputIndex: 0 },
+      { sourceTXID: 'USERTOKEN', sourceOutputIndex: 0 },
+    ]);
+    const res = await request(buildApp()).post('/api/materials/add-and-merge').send(validBody);
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: 'Material token not found or already consumed' });
+    expect(findOne).toHaveBeenCalledWith(expect.objectContaining({ tokenId: 'FUNDINGTX.0' }));
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('400 when another output also carries the stack\'s asset', async () => {
+    (Transaction.fromBEEF as jest.Mock)
+      .mockReturnValueOnce({ id: () => 'PAYTXID', outputs: [{ satoshis: 100 }] })
+      .mockReturnValueOnce({
+        id: () => 'TXID1',
+        inputs: [{ sourceTXID: 'USERTOKEN', sourceOutputIndex: 0 }],
+        outputs: [
+          { lockingScript: inscribed('LOCKSCRIPT_CONTAINS_PS_MARKER', 5, 'phoenix_feather', 'STACKMINT_0') },
+          { lockingScript: inscribed('USER_OWN_LOCK', 5, 'phoenix_feather', 'STACKMINT_0') },
+        ],
+        toBEEF: () => [1, 1],
+      });
+    const res = await request(buildApp()).post('/api/materials/add-and-merge').send(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Output 1 also carries asset STACKMINT_0' });
     expect(enqueue).not.toHaveBeenCalled();
   });
 

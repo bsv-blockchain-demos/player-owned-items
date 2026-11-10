@@ -323,6 +323,20 @@ describe('POST /api/equipment/update', () => {
     expectNotClaimed();
   });
 
+  it('400 when another output also carries a transferred scroll\'s asset', async () => {
+    seedPaymentAndBatchMocks(
+      ['LOCK_PS_0', 'LOCK_PS_1', 'LOCK_PS_2', 'USER_OWN_LOCK'],
+      undefined,
+      [1, 1, 1, 1],
+      ['common_dagger', 'prefix_damage_common', 'suffix_damage_common', 'prefix_damage_common'],
+      ['ORIGMINT_0', 'SCROLLPMINT_0', 'SCROLLSMINT_0', 'SCROLLPMINT_0'],
+    );
+    const res = await post(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Output 3 also carries asset SCROLLPMINT_0' });
+    expectNotClaimed();
+  });
+
   it('400 when a scroll has no recorded mint', async () => {
     delete ownedDocs[SCROLL_P].mintOutpoint;
     seedPaymentAndBatchMocks();

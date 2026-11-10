@@ -399,6 +399,43 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     expectNotClaimed();
   });
 
+  // Input i carries output i: the token at each named output must be the one its own input spends.
+  it('400 when the owned tokens are spent, but not by the inputs paired with their outputs', async () => {
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1'], [defaultBatchInputs[1], defaultBatchInputs[0]]);
+    const res = await post(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Material common_wood transfer does not spend owned token' });
+    expectNotClaimed();
+  });
+
+  // No output beyond the named ones may carry a transferred token's asset (on-chain inflation).
+  it('400 when another output also carries a transferred token\'s asset', async () => {
+    seedPaymentAndBatchMocks(
+      ['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1', 'USER_OWN_LOCK'],
+      defaultBatchInputs,
+      [7, 2, 7],
+      ['common_wood', 'common_leather', 'common_wood'],
+      ['WOODMINT_0', 'LEATHERMINT_0', 'WOODMINT_0'],
+    );
+    const res = await post(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Output 2 also carries asset WOODMINT_0' });
+    expectNotClaimed();
+  });
+
+  it('accepts unrelated extra outputs (wallet change) after the transferred ones', async () => {
+    seedPaymentAndBatchMocks(
+      ['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1', 'WALLET_CHANGE'],
+      defaultBatchInputs,
+      [7, 2, 1],
+      ['common_wood', 'common_leather', undefined as unknown as string],
+      ['WOODMINT_0', 'LEATHERMINT_0', undefined as unknown as string],
+    );
+    seedEnqueueMocks();
+    const res = await post(validBody);
+    expect(res.status).toBe(200);
+  });
+
   it('400 when the owned token has no recorded mint', async () => {
     delete ownedTokens[LEATHER].mintOutpoint;
     seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1']);

@@ -31,6 +31,7 @@ import {
   voutOf,
 } from '@server/lib/materialUnits';
 import { transferAmount, inscribedLootTableId, inscribedAssetId, mintAssetId } from '@server/lib/tokenScript';
+import { inputOutpoint, strayAssetOutput } from '@server/lib/batchTransfer';
 
 const CLAIM_FAILED = 'Inventory items missing or already being minted';
 
@@ -446,18 +447,19 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
     return;
   }
 
-  // The merged token is the one the transfer spends; a user may hold several per material + tier
-  // (e.g. after a marketplace purchase). A junk transfer finds nothing to merge into.
-  const spentOutpoints = transferTransaction.inputs.map(
-    (i) => `${i.sourceTXID || i.sourceTransaction?.id('hex')}.${i.sourceOutputIndex}`,
-  );
-  const existingToken = await materialTokensCollection.findOne({
-    userId,
-    lootTableId,
-    tier,
-    consumed: { $ne: true },
-    tokenId: { $in: spentOutpoints },
-  });
+  // The merged token is the one the input paired with the transfer output spends (input i
+  // carries output i); a user may hold several per material + tier (e.g. after a marketplace
+  // purchase). A junk or unpaired transfer finds nothing to merge into.
+  const pairedInput = transferTransaction.inputs[transferOutputIndex];
+  const existingToken = pairedInput
+    ? await materialTokensCollection.findOne({
+        userId,
+        lootTableId,
+        tier,
+        consumed: { $ne: true },
+        tokenId: inputOutpoint(pairedInput),
+      })
+    : null;
 
   if (!existingToken) {
     res.status(404).json({ error: 'Material token not found or already consumed' });
@@ -490,6 +492,11 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
   const namedAssetId = inscribedAssetId(transferOutput.lockingScript);
   if (namedAssetId !== stackAssetId) {
     res.status(400).json({ error: `Transfer names asset ${namedAssetId ?? 'none'}, not the stack's mint ${stackAssetId}` });
+    return;
+  }
+  const stray = strayAssetOutput(transferTransaction, new Set([transferOutputIndex]), new Set([stackAssetId]));
+  if (stray) {
+    res.status(400).json({ error: stray });
     return;
   }
 
