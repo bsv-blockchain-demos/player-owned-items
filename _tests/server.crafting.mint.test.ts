@@ -33,6 +33,7 @@ const inventoryUpdateMany = jest.fn(async (filter: any, _update: any) => ({ modi
 let playerLevel = 1;
 let equippedItems: Record<string, unknown> = {};
 const playerStatsFindOne = jest.fn(async () => ({ userId: 'u1', level: playerLevel, equippedItems }));
+const playerStatsUpdateOne = jest.fn(async (_filter: any, _update: any) => ({ modifiedCount: 0 }));
 jest.mock('@server/lib/mongodb', () => ({
   connectToMongo: jest.fn(async () => ({
     userInventoryCollection: {
@@ -48,7 +49,7 @@ jest.mock('@server/lib/mongodb', () => ({
       updateOne: materialUpdateOne,
       updateMany: materialUpdateMany,
     },
-    playerStatsCollection: { findOne: playerStatsFindOne },
+    playerStatsCollection: { findOne: playerStatsFindOne, updateOne: playerStatsUpdateOne },
     marketplaceItemsCollection: { findOne: listingFindOne },
   })),
 }));
@@ -792,6 +793,21 @@ describe('POST /api/crafting/mint-and-transfer', () => {
       expect(inventoryDeleteOne).toHaveBeenCalledWith({
         _id: new ObjectId(CRYSTAL), userId: 'u1', tokenId: 'CRYSTALTX.0', pendingClaim: itemClaimId(),
       });
+      // An equip that raced the craft must not leave a slot pointing at the deleted doc.
+      for (const slot of ['weapon', 'armor', 'accessory1', 'accessory2']) {
+        expect(playerStatsUpdateOne).toHaveBeenCalledWith(
+          { userId: 'u1', [`equippedItems.${slot}`]: { $in: [new ObjectId(CRYSTAL)] } },
+          { $unset: { [`equippedItems.${slot}`]: '' } },
+        );
+      }
+    });
+
+    it('touches no equipped slot when the recipe consumes no items', async () => {
+      seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1']);
+      seedEnqueueMocks();
+      const res = await post(validBody);
+      expect(res.status).toBe(200);
+      expect(playerStatsUpdateOne).not.toHaveBeenCalled();
     });
   });
 });

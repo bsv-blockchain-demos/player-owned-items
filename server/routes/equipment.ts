@@ -20,6 +20,7 @@ import { broadcastTX } from '@shared/overlayFunctions';
 import { decodeBeef, encodeBeef } from '@shared/beefEncoding';
 import { TOKEN_PROTOCOL, generateNonce, deriveRecipientKey } from '@shared/tokenDerivation';
 import { getLootItemById } from '@shared/loot-table';
+import { EQUIPMENT_SLOTS } from '@shared/types';
 
 export const equipmentRouter = Router();
 
@@ -309,12 +310,14 @@ equipmentRouter.post('/update', requireAuthProof('update-equipment'), async (req
 
   const playerStats = await playerStatsCollection.findOne({ userId });
   if (playerStats) {
-    const updateFields: any = {};
+    const updateFields: Record<string, ObjectId> = {};
 
-    if (playerStats.equippedWeapon?.equals(oldEquipmentId)) { updateFields.equippedWeapon = newEquipmentId; wasEquipped = true; }
-    if (playerStats.equippedArmor?.equals(oldEquipmentId)) { updateFields.equippedArmor = newEquipmentId; wasEquipped = true; }
-    if (playerStats.equippedAccessory1?.equals(oldEquipmentId)) { updateFields.equippedAccessory1 = newEquipmentId; wasEquipped = true; }
-    if (playerStats.equippedAccessory2?.equals(oldEquipmentId)) { updateFields.equippedAccessory2 = newEquipmentId; wasEquipped = true; }
+    for (const slot of EQUIPMENT_SLOTS) {
+      if (playerStats.equippedItems?.[slot]?.equals(oldEquipmentId)) {
+        updateFields[`equippedItems.${slot}`] = newEquipmentId;
+        wasEquipped = true;
+      }
+    }
 
     if (Object.keys(updateFields).length > 0) {
       await playerStatsCollection.updateOne({ userId }, { $set: updateFields });

@@ -10,7 +10,7 @@
 
 import { Router, type Request, type Response } from 'express';
 import { ObjectId, type WithId } from 'mongodb';
-import type { MaterialToken, UserInventory } from '@shared/types';
+import { EQUIPMENT_SLOTS, type MaterialToken, type UserInventory } from '@shared/types';
 import { Transaction, P2PKH, Beef, Hash } from '@bsv/sdk';
 import { WalletP2PKH } from '@bsv/wallet-helper';
 import { requireAuthProof } from '@server/middleware/requireAuthProof';
@@ -688,6 +688,16 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
         pendingClaim: itemClaimId,
       });
       if (deletedCount !== 1) console.error(`[crafting:mint] consumed item ${item.ownedTokenId} not deleted (claim lost)`);
+    }
+    // An equip that raced this craft would leave a slot pointing at a deleted doc.
+    if (items.length) {
+      const consumedIds = items.map((item) => item.docId);
+      for (const slot of EQUIPMENT_SLOTS) {
+        await playerStatsCollection.updateOne(
+          { userId, [`equippedItems.${slot}`]: { $in: consumedIds } },
+          { $unset: { [`equippedItems.${slot}`]: '' } },
+        );
+      }
     }
 
     // Update change tokens with new outpoint + keyId/counterparty

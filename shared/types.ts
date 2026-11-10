@@ -99,6 +99,8 @@ export interface Inscription {
 }
 
 // User Inventory document
+export const EQUIPMENT_SLOTS: readonly EquipmentSlot[] = ['weapon', 'armor', 'accessory1', 'accessory2'];
+
 export interface UserInventory {
   _id?: ObjectId;
   userId: string;          // Reference to User.userId
@@ -159,12 +161,7 @@ export interface PlayerStats {
   currentHealth: number;
 
   // Equipment slots (single object containing all equipment)
-  equippedItems?: {
-    weapon?: ObjectId;
-    armor?: ObjectId;
-    accessory1?: ObjectId;
-    accessory2?: ObjectId;
-  };
+  equippedItems?: Partial<Record<EquipmentSlot, ObjectId>>;
   equippedConsumables?: [ObjectId | 'empty', ObjectId | 'empty', ObjectId | 'empty', ObjectId | 'empty']; // Array of 4 ('empty' for empty slots) - Enables complex loadout strategies
   equippedSpell?: ObjectId | 'empty'; // Phase 2.6: Spell scroll slot (Q key)
   lastSpellCast?: number; // Phase 2.6: Server-side spell cooldown tracking (timestamp in ms)

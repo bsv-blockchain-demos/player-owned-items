@@ -64,6 +64,7 @@ jest.mock('@bsv/sdk', () => ({
 
 import request from 'supertest';
 import { buildApp } from '@server/app';
+import { ObjectId } from 'mongodb';
 import { Transaction } from '@bsv/sdk';
 import { broadcastTX } from '@shared/overlayFunctions';
 
@@ -289,5 +290,21 @@ describe('POST /api/equipment/update', () => {
     expect(res.body).toEqual({ error: 'Internal server error' });
     expect(nftInsertOne).not.toHaveBeenCalled();
     expect(inventoryInsertOne).not.toHaveBeenCalled();
+  });
+
+  it('moves the equipped slot to the re-minted item', async () => {
+    const original = new ObjectId(validBody.originalEquipmentInventoryId);
+    const reminted = new ObjectId();
+    equipmentFindOne.mockResolvedValueOnce({ _id: original, nftLootId: 'NFT_ORIG', tier: 1 });
+    inventoryInsertOne.mockResolvedValueOnce({ insertedId: reminted } as any);
+    playerStatsFindOne.mockResolvedValueOnce({ userId: 'u1', equippedItems: { armor: new ObjectId(), weapon: original } } as any);
+    seedPaymentAndBatchMocks();
+    seedEnqueueMocks();
+
+    const res = await request(buildApp()).post('/api/equipment/update').send(validBody);
+
+    expect(res.status).toBe(200);
+    expect(res.body.wasEquipped).toBe(true);
+    expect(playerStatsUpdateOne).toHaveBeenCalledWith({ userId: 'u1' }, { $set: { 'equippedItems.weapon': reminted } });
   });
 });

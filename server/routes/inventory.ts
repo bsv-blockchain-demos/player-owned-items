@@ -29,7 +29,7 @@ inventoryRouter.get('/get', requireSession, async (req: Request, res: Response) 
     const listedMaterialIds = new Set<string>();
     if (excludeListed) {
       const activeListings = await marketplaceItemsCollection
-        .find({ sellerId: userId, status: 'active' })
+        .find({ sellerId: userId, status: { $in: ['active', 'pending'] } }) // pending = mid-purchase
         .toArray();
       for (const l of activeListings) {
         if (l.inventoryItemId) excludedInventoryIds.add(l.inventoryItemId);
@@ -131,9 +131,9 @@ inventoryRouter.get('/get', requireSession, async (req: Request, res: Response) 
               item.mintOutpoint = nftLoot.mintOutpoint;
             }
 
-            // Provide current token location (full outpoint format: txid.vout)
-            item.tokenId = nftLoot.tokenId; // Current location on blockchain
-            item.currentTokenId = nftLoot.tokenId; // Backward compatibility
+            // Current location: the inventory doc is canonical (a purchase moves only it), NFTLoot is the fallback.
+            item.tokenId = item.tokenId ?? nftLoot.tokenId;
+            item.currentTokenId = item.tokenId; // Backward compatibility
           }
         }
       });
