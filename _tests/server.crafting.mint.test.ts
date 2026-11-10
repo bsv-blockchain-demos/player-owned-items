@@ -176,13 +176,17 @@ function expectNotClaimed() {
 }
 
 /** The two dependent wallet actions inside the queue (mint crafted item, then transfer). */
-function seedEnqueueMocks(materialInputCount = 2, nonces = ['N_MINT', 'N_ITEM', 'N_CHANGE']) {
+function seedEnqueueMocks(materialInputCount = 2, nonces = ['N_MINT', 'N_ITEM', 'N_CHANGE'], walletFundingInputs = 0) {
   (Transaction.fromBEEF as jest.Mock)
     .mockReturnValueOnce({ inputs: [{ unlockingScript: { toHex: () => 'MINTUNLOCK' } }], sign: async () => {} }) // craftedItemTxToSign
     .mockReturnValueOnce({
-      inputs: Array.from({ length: materialInputCount + 1 }, (_, i) => ({ unlockingScript: { toHex: () => `U${i}` } })),
+      inputs: [
+        ...Array.from({ length: materialInputCount + 1 }, (_, i) => ({ unlockingScript: { toHex: () => `U${i}` } })),
+        // Funding inputs the wallet appends when the 1-sat inputs can't pay the fee: no template, the wallet signs them.
+        ...Array.from({ length: walletFundingInputs }, () => ({})),
+      ],
       sign: async () => {},
-    }); // txToSign (materials + crafted item)
+    }); // txToSign (materials + crafted item [+ wallet funding])
 
   // Both txids are derived locally via .id('hex') on the fromAtomicBEEF result. The two
   // mockReturnValueOnce calls cover the calls made INSIDE enqueue (mint then transfer);
@@ -608,6 +612,20 @@ describe('POST /api/crafting/mint-and-transfer', () => {
       { _id: new ObjectId(WOOD_T3), userId: 'u1', tokenId: 'WOODT3TX.0', pendingClaim: claim },
       expect.objectContaining({ $set: expect.objectContaining({ tokenId: 'TRANSFERTX.1', quantity: 2 }) }),
     );
+  });
+
+  it('signs only its own inputs when the wallet adds funding inputs (every stack has change)', async () => {
+    ownedTokens[LEATHER].quantity = 3; // 3 - 2 = 1 change; wood 7 - 5 = 2 change: no 1-sat input is freed for the fee
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1'], defaultBatchInputs, [7, 3]);
+    seedEnqueueMocks(2, ['N_MINT', 'N_ITEM', 'N_CHANGE_1', 'N_CHANGE_2'], 1);
+
+    const res = await post(validBody);
+
+    expect(res.status).toBe(200);
+    expect(stubWallet.signAction).toHaveBeenLastCalledWith({
+      reference: 'REF2',
+      spends: { 0: { unlockingScript: 'U0' }, 1: { unlockingScript: 'U1' }, 2: { unlockingScript: 'U2' } },
+    });
   });
 
   it('500s and releases the token claim when the wallet queue throws', async () => {

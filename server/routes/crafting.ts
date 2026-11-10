@@ -528,8 +528,10 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
     await txToSign.sign();
     step('local sign done (transfer)');
 
+    // Only the inputs this route added. When the 1-sat inputs can't pay the fee (every
+    // stack has change), the wallet appends its own funding inputs and signs those itself.
     const spends: Record<string, any> = {};
-    for (let i = 0; i < txToSign.inputs.length; i++) {
+    for (let i = 0; i <= craftedInputIndex; i++) {
       const unlockingScript = txToSign.inputs[i].unlockingScript;
       if (!unlockingScript) throw new Error(`Missing unlocking script for input ${i}`);
       spends[String(i)] = { unlockingScript: unlockingScript.toHex() };
