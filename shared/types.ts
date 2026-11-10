@@ -128,6 +128,7 @@ export interface UserInventory {
   keyId?: string;           // Nonce used to derive the key locking this token (absent = legacy)
   counterparty?: string;    // Derivation counterparty (server identity key)
   mintClaim?: string;       // Set while this material unit is being minted into a token
+  pendingClaim?: string;    // Set while a craft is spending this minted item
 
   // Equipment Customization (Phase 1: Inscriptions)
   prefix?: Inscription;     // Prefix inscription (e.g., "Savage" +5 damage)

@@ -396,6 +396,92 @@ describe('POST /api/marketplace/list-item (material token)', () => {
   });
 });
 
+describe('POST /api/marketplace/list-item (item a craft may claim)', () => {
+  const ITEM_OID = '64b0000000000000000000cd';
+  const itemBody = {
+    proof: {},
+    inventoryItemId: ITEM_OID.toUpperCase(), // case must not dodge listing lookups
+    price: 500,
+    userPublicKey: 'PUBKEY',
+    listingNonce: 'LNONCE',
+    ordLockOutpoint: 'ORDTX.0',
+    ordLockScript: 'ORDSCRIPT_HEX',
+    ordLockBeef: 'ORDLOCK_BEEF_B64',
+  };
+  const ownedItem = {
+    _id: new ObjectId(ITEM_OID),
+    userId: 'user-123',
+    lootTableId: 'spirit_crystal',
+    tier: 1,
+    nftLootId: new ObjectId(),
+    tokenId: 'ITEMTX.0',
+    mintOutpoint: 'ITEMTX.0',
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    seedValidProof();
+    usersFindOne.mockResolvedValue({ userId: 'user-123', username: 'alice' });
+    itemsFindOne.mockResolvedValue(null);
+    userInventoryUpdateOne.mockResolvedValue({ modifiedCount: 1 });
+  });
+
+  function seedListingTx() {
+    itemsInsertOne.mockResolvedValueOnce({ insertedId: { toString: () => 'NEW_LISTING_ID' } });
+    ordLockLock.mockResolvedValueOnce({ toHex: () => 'ORDSCRIPT_HEX' });
+    fromBEEF.mockReturnValueOnce({
+      inputs: [{ sourceTXID: 'ITEMTX', sourceOutputIndex: 0 }],
+      outputs: [{ satoshis: 1, lockingScript: { toHex: () => 'ORDSCRIPT_HEX' } }],
+    });
+  }
+
+  const post = async () =>
+    request(appWithMarketplaceRouter())
+      .post('/api/marketplace/list-item')
+      .set('Cookie', await authCookie())
+      .send(itemBody);
+
+  it('409s when a craft holds a claim on the item', async () => {
+    userInventoryFindOne.mockResolvedValueOnce({ ...ownedItem, pendingClaim: 'CLAIM' });
+
+    const res = await post();
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'Material tokens are already in use' });
+    expect(itemsInsertOne).not.toHaveBeenCalled();
+  });
+
+  it('lists with a lowercase inventoryItemId and moves the item only while it is unclaimed at its outpoint', async () => {
+    userInventoryFindOne.mockResolvedValue(ownedItem); // read again before the token moves
+    seedListingTx();
+
+    const res = await post();
+
+    expect(res.status).toBe(200);
+    expect(itemsFindOne).toHaveBeenCalledWith({ inventoryItemId: ITEM_OID, status: 'active' });
+    expect(itemsInsertOne).toHaveBeenCalledWith(expect.objectContaining({ inventoryItemId: ITEM_OID }));
+    expect(userInventoryUpdateOne).toHaveBeenCalledWith(
+      { _id: new ObjectId(ITEM_OID), userId: 'user-123', tokenId: 'ITEMTX.0', pendingClaim: { $exists: false } },
+      { $set: expect.objectContaining({ tokenId: 'ORDTX.0' }) },
+    );
+    expect(nftLootUpdateOne).toHaveBeenCalledWith({ _id: ownedItem.nftLootId }, { $set: expect.objectContaining({ tokenId: 'ORDTX.0' }) });
+  });
+
+  it('409s and removes the listing when the item was claimed after it was read', async () => {
+    userInventoryFindOne.mockResolvedValue(ownedItem); // read again before the token moves
+    seedListingTx();
+    userInventoryUpdateOne.mockResolvedValueOnce({ modifiedCount: 0 });
+
+    const res = await post();
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'Material tokens are already in use' });
+    expect(itemsDeleteOne).toHaveBeenCalledWith({ _id: expect.anything() });
+    expect(beefsDeleteOne).toHaveBeenCalledWith({ listingId: 'NEW_LISTING_ID' });
+    expect(nftLootUpdateOne).not.toHaveBeenCalled();
+  });
+});
+
 describe('POST /api/marketplace/cancel-listing', () => {
   beforeEach(() => jest.clearAllMocks());
 

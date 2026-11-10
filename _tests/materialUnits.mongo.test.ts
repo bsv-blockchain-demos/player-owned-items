@@ -8,8 +8,8 @@ import {
   claimMaterialUnits,
   releaseMaterialUnits,
   consumeMaterialUnits,
-  claimMaterialTokens,
-  releaseMaterialTokens,
+  claimTokens,
+  releaseTokens,
 } from '@server/lib/materialUnits';
 
 jest.setTimeout(120_000); // first run downloads a mongod binary
@@ -105,7 +105,7 @@ describe('claimMaterialUnits (real mongod)', () => {
   });
 });
 
-describe('claimMaterialTokens (real mongod)', () => {
+describe('claimTokens (real mongod)', () => {
   async function token(tokenId: string, overrides: Partial<MaterialToken> = {}): Promise<ObjectId> {
     const { insertedId } = await tokens.insertOne({
       userId: 'u1',
@@ -123,7 +123,7 @@ describe('claimMaterialTokens (real mongod)', () => {
     const a = await token('A.0');
     const b = await token('B.0');
 
-    const claimId = await claimMaterialTokens(tokens, 'u1', [{ _id: a, tokenId: 'A.0' }, { _id: b, tokenId: 'B.0' }]);
+    const claimId = await claimTokens(tokens, 'u1', [{ _id: a, tokenId: 'A.0' }, { _id: b, tokenId: 'B.0' }]);
 
     expect(await tokens.countDocuments({ pendingClaim: claimId! })).toBe(2);
   });
@@ -131,17 +131,17 @@ describe('claimMaterialTokens (real mongod)', () => {
   it('claims nothing when a token has moved on (stale outpoint) or is already claimed', async () => {
     const a = await token('A.0');
     const b = await token('B.1'); // DB moved on from B.0
-    expect(await claimMaterialTokens(tokens, 'u1', [{ _id: a, tokenId: 'A.0' }, { _id: b, tokenId: 'B.0' }])).toBeNull();
+    expect(await claimTokens(tokens, 'u1', [{ _id: a, tokenId: 'A.0' }, { _id: b, tokenId: 'B.0' }])).toBeNull();
     expect(await tokens.countDocuments({ pendingClaim: { $exists: true } })).toBe(0);
 
-    const held = await claimMaterialTokens(tokens, 'u1', [{ _id: a, tokenId: 'A.0' }]);
-    expect(await claimMaterialTokens(tokens, 'u1', [{ _id: a, tokenId: 'A.0' }])).toBeNull();
-    await releaseMaterialTokens(tokens, held!);
-    expect(await claimMaterialTokens(tokens, 'u1', [{ _id: a, tokenId: 'A.0' }])).toEqual(expect.any(String));
+    const held = await claimTokens(tokens, 'u1', [{ _id: a, tokenId: 'A.0' }]);
+    expect(await claimTokens(tokens, 'u1', [{ _id: a, tokenId: 'A.0' }])).toBeNull();
+    await releaseTokens(tokens, held!);
+    expect(await claimTokens(tokens, 'u1', [{ _id: a, tokenId: 'A.0' }])).toEqual(expect.any(String));
   });
 
   it("does not claim another user's token", async () => {
     const a = await token('A.0', { userId: 'u2' });
-    expect(await claimMaterialTokens(tokens, 'u1', [{ _id: a, tokenId: 'A.0' }])).toBeNull();
+    expect(await claimTokens(tokens, 'u1', [{ _id: a, tokenId: 'A.0' }])).toBeNull();
   });
 });

@@ -23,8 +23,8 @@ import {
   claimMaterialUnits,
   releaseMaterialUnits,
   consumeMaterialUnits,
-  claimMaterialTokens,
-  releaseMaterialTokens,
+  claimTokens,
+  releaseTokens,
   TOKEN_CLAIM_FAILED,
   anyTokenListed,
   TOKEN_LISTED,
@@ -494,7 +494,7 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
   // Obtained before claiming so a queue failure can't strand the claims.
   const queue = await getWalletQueue();
 
-  const tokenClaimId = await claimMaterialTokens(materialTokensCollection, userId, [
+  const tokenClaimId = await claimTokens(materialTokensCollection, userId, [
     { _id: existingToken._id, tokenId: existingToken.tokenId },
   ]);
   if (!tokenClaimId) {
@@ -503,7 +503,7 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
   }
   const claimId = await claimMaterialUnits(userInventoryCollection, userId, lootItem.lootId, tier, inventoryIds);
   if (!claimId) {
-    await releaseMaterialTokens(materialTokensCollection, tokenClaimId);
+    await releaseTokens(materialTokensCollection, tokenClaimId);
     res.status(409).json({ error: CLAIM_FAILED });
     return;
   }
@@ -669,7 +669,7 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
     };
   }).catch(async (err) => {
     await releaseMaterialUnits(userInventoryCollection, claimId);
-    await releaseMaterialTokens(materialTokensCollection, tokenClaimId);
+    await releaseTokens(materialTokensCollection, tokenClaimId);
     throw err;
   });
 

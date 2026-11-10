@@ -18,12 +18,15 @@ const materialTokensFind = jest.fn(() => ({ toArray: materialTokensToArray }));
 const marketplaceItemsToArray = jest.fn(async () => [] as any[]);
 const marketplaceItemsFind = jest.fn(() => ({ toArray: marketplaceItemsToArray }));
 
+const playerStatsFindOne = jest.fn(async (): Promise<unknown> => null);
+
 jest.mock('@server/lib/mongodb', () => ({
   connectToMongo: jest.fn(async () => ({
     userInventoryCollection: { find: userInventoryFind },
     nftLootCollection: { find: nftLootFind },
     materialTokensCollection: { find: materialTokensFind },
     marketplaceItemsCollection: { find: marketplaceItemsFind },
+    playerStatsCollection: { findOne: playerStatsFindOne },
   })),
 }));
 
@@ -32,6 +35,7 @@ import cookieParser from 'cookie-parser';
 import request from 'supertest';
 import { inventoryRouter } from '@server/routes/inventory';
 import { createJWT } from '@server/lib/jwt';
+import { ObjectId } from 'mongodb';
 
 function appWithInventoryRouter() {
   const app = express();
@@ -103,5 +107,22 @@ describe('GET /api/inventory/get', () => {
     expect(res.body.success).toBe(true);
     expect(res.body.totalItems).toBe(0);
     expect(res.body.inventory).toEqual([]);
+  });
+
+  it('excludes equipped items when excludeEquipped=true', async () => {
+    const equippedId = new ObjectId();
+    const looseId = new ObjectId();
+    const item = (_id: ObjectId) => ({ _id, userId: 'user-123', lootTableId: 'spirit_crystal', tier: 1, acquiredAt: new Date() });
+    userInventoryToArray.mockResolvedValueOnce([item(equippedId), item(looseId)]);
+    materialTokensToArray.mockResolvedValueOnce([]);
+    playerStatsFindOne.mockResolvedValueOnce({ userId: 'user-123', equippedItems: { accessory1: equippedId } });
+
+    const res = await request(appWithInventoryRouter())
+      .get('/api/inventory/get?excludeEquipped=true')
+      .set('Cookie', await authCookie());
+
+    expect(res.status).toBe(200);
+    expect(res.body.inventory.map((i: { inventoryId: string }) => i.inventoryId)).toEqual([looseId.toHexString()]);
+    expect(playerStatsFindOne).toHaveBeenCalledWith({ userId: 'user-123' });
   });
 });

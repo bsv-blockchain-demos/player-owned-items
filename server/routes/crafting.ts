@@ -10,7 +10,7 @@
 
 import { Router, type Request, type Response } from 'express';
 import { ObjectId, type WithId } from 'mongodb';
-import type { MaterialToken } from '@shared/types';
+import type { MaterialToken, UserInventory } from '@shared/types';
 import { Transaction, P2PKH, Beef, Hash } from '@bsv/sdk';
 import { WalletP2PKH } from '@bsv/wallet-helper';
 import { requireAuthProof } from '@server/middleware/requireAuthProof';
@@ -25,11 +25,12 @@ import { getLootItemById } from '@shared/loot-table';
 import { getRecipeById } from '@shared/recipe-table';
 import { publicKeyToGradient } from '@shared/publicKeyToColor';
 import {
-  claimMaterialTokens,
-  releaseMaterialTokens,
+  claimTokens,
+  releaseTokens,
   TOKEN_CLAIM_FAILED,
   anyTokenListed,
   TOKEN_LISTED,
+  ITEM_LISTED,
   voutOf,
   transferAmount,
 } from '@server/lib/materialUnits';
@@ -46,6 +47,7 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
   const {
     recipeId,
     transferredMaterials, // Array of {lootTableId, tokenId, materialTokenId}: batch-tx outpoint + MaterialToken _id
+    transferredItems = [], // Array of {lootTableId, tokenId, inventoryItemId}: batch-tx outpoint + minted UserInventory _id
     userIdentityKey, // derivation counterparty
     paymentTx, // base64 WalletP2PKH payment BEEF
     batchTransferBeef, // base64 BEEF of client's single batch transfer (all materials, shared N2)
@@ -53,7 +55,11 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
     walletParams,
   } = req.body;
 
-  if (!transferredMaterials || !Array.isArray(transferredMaterials) || transferredMaterials.length === 0) {
+  if (
+    !Array.isArray(transferredMaterials) ||
+    !Array.isArray(transferredItems) ||
+    transferredMaterials.length + transferredItems.length === 0
+  ) {
     res.status(400).json({ error: 'Missing or invalid transferredMaterials' });
     return;
   }
@@ -105,11 +111,38 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
   }
   const transfers = entries as Array<{ lootTableId: string; tokenId: string; materialTokenId: string }>;
 
-  const requiredQuantities = new Map(recipe.requiredMaterials.map((r) => [r.lootTableId, r.quantity]));
+  // Non-material requirements (artifacts) are minted item NFTs, one per unit.
+  const itemEntries = transferredItems as Array<{ lootTableId: unknown; tokenId: unknown; inventoryItemId: unknown }>;
+  const batchOutpoints = [...entries, ...itemEntries].map((m) => m?.tokenId);
+  if (
+    !itemEntries.every(
+      (m) =>
+        typeof m?.lootTableId === 'string' &&
+        typeof m.tokenId === 'string' &&
+        typeof m.inventoryItemId === 'string' &&
+        m.inventoryItemId.length === 24 &&
+        ObjectId.isValid(m.inventoryItemId),
+    ) ||
+    new Set(itemEntries.map((m) => (m.inventoryItemId as string).toLowerCase())).size !== itemEntries.length ||
+    new Set(batchOutpoints).size !== batchOutpoints.length
+  ) {
+    res.status(400).json({ error: 'Invalid transferredItems' });
+    return;
+  }
+  const itemTransfers = itemEntries as Array<{ lootTableId: string; tokenId: string; inventoryItemId: string }>;
+
+  const isMaterialRequirement = (lootTableId: string) => getLootItemById(lootTableId)?.type === 'material';
+  const requiredQuantities = new Map(
+    recipe.requiredMaterials.filter((r) => isMaterialRequirement(r.lootTableId)).map((r) => [r.lootTableId, r.quantity]),
+  );
+  const requiredItems = recipe.requiredMaterials.filter((r) => !isMaterialRequirement(r.lootTableId));
   const transferredLootIds = new Set(transfers.map((m) => m.lootTableId));
+  const itemCount = (lootTableId: string) => itemTransfers.filter((t) => t.lootTableId === lootTableId).length;
   if (
     transferredLootIds.size !== requiredQuantities.size ||
-    ![...transferredLootIds].every((id) => requiredQuantities.has(id))
+    ![...transferredLootIds].every((id) => requiredQuantities.has(id)) ||
+    itemTransfers.length !== requiredItems.reduce((sum, r) => sum + r.quantity, 0) ||
+    !requiredItems.every((r) => itemCount(r.lootTableId) === r.quantity)
   ) {
     res.status(400).json({ error: `Transferred materials do not match recipe ${recipe.recipeId}` });
     return;
@@ -122,12 +155,10 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
   const { userInventoryCollection, nftLootCollection, materialTokensCollection, playerStatsCollection, marketplaceItemsCollection } =
     await connectToMongo();
 
-  if (recipe.unlocksAtLevel) {
-    const playerStats = await playerStatsCollection.findOne({ userId });
-    if ((playerStats?.level ?? 1) < recipe.unlocksAtLevel) {
-      res.status(403).json({ error: `Recipe ${recipe.recipeId} requires level ${recipe.unlocksAtLevel}` });
-      return;
-    }
+  const playerStats = await playerStatsCollection.findOne({ userId });
+  if (recipe.unlocksAtLevel && (playerStats?.level ?? 1) < recipe.unlocksAtLevel) {
+    res.status(403).json({ error: `Recipe ${recipe.recipeId} requires level ${recipe.unlocksAtLevel}` });
+    return;
   }
 
   // Quantities and metadata come from the user's DB tokens + loot table, never the body.
@@ -145,6 +176,33 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
     }
     ownedTokens.push(owned);
   }
+
+  const equipped = new Set(Object.values(playerStats?.equippedItems ?? {}).filter(Boolean).map(String));
+  const ownedItems: WithId<UserInventory>[] = [];
+  for (const transfer of itemTransfers) {
+    const owned = await userInventoryCollection.findOne({
+      _id: new ObjectId(transfer.inventoryItemId),
+      userId,
+      lootTableId: transfer.lootTableId,
+      nftLootId: { $type: 'objectId' },
+      tokenId: { $type: 'string' },
+    });
+    if (!owned) {
+      res.status(400).json({ error: `Item ${transfer.lootTableId} not owned` });
+      return;
+    }
+    if (equipped.has(owned._id.toHexString())) {
+      res.status(409).json({ error: `Item ${transfer.lootTableId} is equipped` });
+      return;
+    }
+    ownedItems.push(owned);
+  }
+  const items = itemTransfers.map((transfer, i) => ({
+    lootTableId: transfer.lootTableId,
+    tokenId: transfer.tokenId, // outpoint in the batch transfer tx
+    docId: ownedItems[i]._id,
+    ownedTokenId: ownedItems[i].tokenId!, // outpoint the batch transfer must spend
+  }));
 
   for (const [lootTableId, needed] of requiredQuantities) {
     const have = ownedTokens.filter((t) => t.lootTableId === lootTableId).reduce((sum, t) => sum + t.quantity, 0);
@@ -225,36 +283,50 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
     ),
   );
 
-  // Validate each transferred material output
+  // Validate each transferred output: materials, then items
   const batchTxId = batchTransferTransaction.id('hex');
-  for (const material of materials) {
-    const vout = voutOf(material.tokenId, batchTxId);
+  const transferredOutputs = [
+    ...materials.map((m) => ({
+      label: `Material ${m.lootTableId}`,
+      tokenId: m.tokenId,
+      ownedTokenId: m.ownedTokenId,
+      amount: m.quantity,
+      amountRule: `must carry the full token quantity (${m.quantity})`,
+    })),
+    ...items.map((t) => ({
+      label: `Item ${t.lootTableId}`,
+      tokenId: t.tokenId,
+      ownedTokenId: t.ownedTokenId,
+      amount: 1,
+      amountRule: 'must carry amount 1',
+    })),
+  ];
+  for (const output of transferredOutputs) {
+    const vout = voutOf(output.tokenId, batchTxId);
     if (vout === null) {
-      res.status(400).json({ error: `Transfer outpoint not in batch transfer: ${material.tokenId}` });
+      res.status(400).json({ error: `Transfer outpoint not in batch transfer: ${output.tokenId}` });
       return;
     }
     const transferOutput = batchTransferTransaction.outputs[vout];
 
     if (!transferOutput) {
-      res.status(404).json({ error: `Transfer output not found: ${material.tokenId}` });
+      res.status(404).json({ error: `Transfer output not found: ${output.tokenId}` });
       return;
     }
 
     if (!transferOutput.lockingScript.toHex().includes(expectedScriptPattern)) {
-      res.status(400).json({ error: `Material ${material.lootTableId} not locked to server derived key` });
+      res.status(400).json({ error: `${output.label} not locked to server derived key` });
       return;
     }
 
-    if (!spentOutpoints.has(material.ownedTokenId)) {
-      res.status(400).json({ error: `Material ${material.lootTableId} transfer does not spend owned token` });
+    if (!spentOutpoints.has(output.ownedTokenId)) {
+      res.status(400).json({ error: `${output.label} transfer does not spend owned token` });
       return;
     }
 
     // A partial amount would leave the rest of the token untracked on chain.
-    if (transferAmount(transferOutput.lockingScript) !== material.quantity) {
-      res.status(400).json({
-        error: `Material ${material.lootTableId} transfer must carry the full token quantity (${material.quantity})`,
-      });
+    if (transferAmount(transferOutput.lockingScript) !== output.amount) {
+      res.status(400).json({ error: `${output.label} transfer ${output.amountRule}` });
       return;
     }
   }
@@ -284,6 +356,7 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
     craftingProof: {
       recipeId: recipe.recipeId,
       materialTokens: materials.map((m) => m.tokenId),
+      itemTokens: items.map((t) => t.tokenId),
     },
   };
 
@@ -292,17 +365,31 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
     res.status(409).json({ error: TOKEN_LISTED });
     return;
   }
+  if (items.length && (await anyTokenListed(marketplaceItemsCollection, items.map((t) => t.docId), 'inventoryItemId'))) {
+    res.status(409).json({ error: ITEM_LISTED });
+    return;
+  }
 
   // Obtained before claiming so a queue failure can't strand the claim.
   const queue = await getWalletQueue();
 
   // A concurrent craft/merge (e.g. a replayed batch transfer) can't spend the same tokens.
-  const tokenClaimId = await claimMaterialTokens(
+  const tokenClaimId = await claimTokens(
     materialTokensCollection,
     userId,
     materials.map((m) => ({ _id: m.docId, tokenId: m.ownedTokenId })),
   );
   if (!tokenClaimId) {
+    res.status(409).json({ error: TOKEN_CLAIM_FAILED });
+    return;
+  }
+  const itemClaimId = await claimTokens(
+    userInventoryCollection,
+    userId,
+    items.map((t) => ({ _id: t.docId, tokenId: t.ownedTokenId })),
+  );
+  if (!itemClaimId) {
+    await releaseTokens(materialTokensCollection, tokenClaimId);
     res.status(409).json({ error: TOKEN_CLAIM_FAILED });
     return;
   }
@@ -367,7 +454,7 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
 
     const serverIdentityKey = await getServerIdentityPublicKey();
 
-    // Shared unlock template for all transferred materials (N2)
+    // Shared unlock template for all transferred materials and items (N2)
     const materialsUnlockTemplate = ordinalP2PKH.unlock(
       serverWallet, 'all', false, undefined, undefined,
       transferNonce
@@ -383,12 +470,12 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
     );
     const craftedUnlockLength = await craftedUnlockTemplate.estimateLength();
 
-    // Build inputs: all materials first, then crafted item
+    // Build inputs: all materials, then items, then crafted item
     const transferInputs: any[] = [];
-    for (const material of materials) {
+    for (const input of [...materials.map((m) => ({ kind: 'Material', ...m })), ...items.map((t) => ({ kind: 'Item', ...t }))]) {
       transferInputs.push({
-        inputDescription: `Material: ${material.lootTableId}`,
-        outpoint: material.tokenId,
+        inputDescription: `${input.kind}: ${input.lootTableId}`,
+        outpoint: input.tokenId,
         unlockingScriptLength: materialsUnlockLength,
       });
     }
@@ -461,8 +548,8 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
     const reference = transferActionRes.signableTransaction.reference;
     const txToSign = Transaction.fromBEEF(transferActionRes.signableTransaction.tx);
 
-    // Apply unlock templates: materials use shared template, crafted item uses its own
-    const materialInputCount = materials.length;
+    // Apply unlock templates: materials + items use the shared template, crafted item uses its own
+    const materialInputCount = materials.length + items.length;
     if (!Number.isSafeInteger(materialInputCount) || materialInputCount < 0) {
       throw new Error('Invalid material input count');
     }
@@ -508,7 +595,8 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
       serverIdentityKey,
     };
   }).catch(async (err) => {
-    await releaseMaterialTokens(materialTokensCollection, tokenClaimId);
+    await releaseTokens(materialTokensCollection, tokenClaimId);
+    await releaseTokens(userInventoryCollection, itemClaimId);
     throw err;
   });
 
@@ -592,6 +680,16 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
       if (deletedCount !== 1) console.error(`[crafting:mint] consumed token ${material.ownedTokenId} not deleted (claim lost)`);
     }
 
+    for (const item of items) {
+      const { deletedCount } = await userInventoryCollection.deleteOne({
+        _id: item.docId,
+        userId,
+        tokenId: item.ownedTokenId,
+        pendingClaim: itemClaimId,
+      });
+      if (deletedCount !== 1) console.error(`[crafting:mint] consumed item ${item.ownedTokenId} not deleted (claim lost)`);
+    }
+
     // Update change tokens with new outpoint + keyId/counterparty
     for (let i = 0; i < materialChanges.length; i++) {
       const change = materialChanges[i];
@@ -625,7 +723,7 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
     dbRecorded = true;
     step('db written');
   } catch (dbErr) {
-    console.error(`[crafting:mint] DB write failed after on-chain craft ${result.transferTxId} (claim ${tokenClaimId} held):`, dbErr);
+    console.error(`[crafting:mint] DB write failed after on-chain craft ${result.transferTxId} (claims ${tokenClaimId}, ${itemClaimId} held):`, dbErr);
   }
 
   // Build received[] aligned to transfer tx output indices

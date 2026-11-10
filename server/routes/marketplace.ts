@@ -610,6 +610,7 @@ marketplaceRouter.post('/list-item', requireAuthProof('list'), async (req: Reque
 
     // Stored canonical (lowercase) so crafting/merging can't miss a listing by id case.
     const materialTokenHex = materialTokenId ? new ObjectId(materialTokenId).toHexString() : undefined;
+    const inventoryItemHex = inventoryItemId ? new ObjectId(inventoryItemId).toHexString() : undefined;
 
     const {
       usersCollection,
@@ -674,9 +675,15 @@ marketplaceRouter.post('/list-item', requireAuthProof('list'), async (req: Reque
         return;
       }
 
+      // A craft is spending it.
+      if (item.pendingClaim) {
+        res.status(409).json({ error: TOKEN_CLAIM_FAILED });
+        return;
+      }
+
       // Check if already listed
       const existingListing = await marketplaceItemsCollection.findOne({
-        inventoryItemId: inventoryItemId,
+        inventoryItemId: inventoryItemHex,
         status: 'active'
       });
 
@@ -695,7 +702,7 @@ marketplaceRouter.post('/list-item', requireAuthProof('list'), async (req: Reque
       assetId = item.mintOutpoint?.replace('.', '_'); // txid_vout format
 
       itemData = {
-        inventoryItemId: inventoryItemId,
+        inventoryItemId: inventoryItemHex,
         lootTableId: item.lootTableId,
         itemName: lootItem.name,
         itemIcon: lootItem.icon,
@@ -871,8 +878,8 @@ marketplaceRouter.post('/list-item', requireAuthProof('list'), async (req: Reque
 
     if (inventoryItemId) {
       const item = await userInventoryCollection.findOne({ _id: new ObjectId(inventoryItemId), userId });
-      await userInventoryCollection.updateOne(
-        { _id: new ObjectId(inventoryItemId), userId },
+      const { modifiedCount } = await userInventoryCollection.updateOne(
+        { _id: new ObjectId(inventoryItemId), userId, tokenId: currentTokenId, pendingClaim: { $exists: false } },
         {
           $set: {
             tokenId: ordLockOutpoint,
@@ -880,6 +887,13 @@ marketplaceRouter.post('/list-item', requireAuthProof('list'), async (req: Reque
           }
         }
       );
+      // Claimed by a craft since it was read: that request owns the item.
+      if (modifiedCount !== 1) {
+        await marketplaceItemsCollection.deleteOne({ _id: result.insertedId });
+        await marketplaceListingBeefsCollection.deleteOne({ listingId: result.insertedId.toString() });
+        res.status(409).json({ error: TOKEN_CLAIM_FAILED });
+        return;
+      }
 
       if (item?.nftLootId) {
         await nftLootCollection.updateOne(

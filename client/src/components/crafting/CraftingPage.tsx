@@ -22,6 +22,7 @@ interface MaterialItem {
   inventoryId: string;
   materialTokenId?: string;
   lootTableId: string;
+  itemType: LootItem['type'];
   name: string;
   icon: string;
   tier: number;
@@ -63,8 +64,8 @@ export default function CraftingPage() {
     try {
       setLoading(true);
 
-      // Fetch player materials (only type: 'material' items, minted only)
-      const materialsResponse = await apiFetch('/api/inventory/get?mintedOnly=true&excludeListed=true'); // listed tokens sit in an OrdLock
+      // Fetch player materials and minted items (artifact recipe inputs), minted only
+      const materialsResponse = await apiFetch('/api/inventory/get?mintedOnly=true&excludeListed=true&excludeEquipped=true'); // listed tokens sit in an OrdLock; equipped items can't be consumed
       const materialsData = await materialsResponse.json();
 
       if (materialsResponse.ok && materialsData.success) {
@@ -74,13 +75,14 @@ export default function CraftingPage() {
 
         materialsData.inventory.forEach((item: any) => {
           const lootItem = getLootItemById(item.lootId);
-          // Backend already filters for minted items, this is a safety check
-          if (lootItem && lootItem.type === 'material' && item.tokenId) {
+          // Material tokens, plus item NFTs (one unit each) for artifact requirements
+          if (lootItem && item.tokenId && (lootItem.type === 'material' || item.nftLootId)) {
             // Track full material item data
             materialItems.push({
               inventoryId: item.inventoryId,
               materialTokenId: item.materialTokenId,
               lootTableId: item.lootId,
+              itemType: lootItem.type,
               name: lootItem.name,
               icon: lootItem.icon,
               tier: item.tier || 1,
@@ -202,8 +204,8 @@ export default function CraftingPage() {
           transactionId: material.transactionId!,
           name: material.name,
           rarity: lootItem?.rarity || 'common',
-          type: lootItem?.type || 'material',
-          itemType: 'material' as const,
+          type: material.itemType,
+          itemType: material.itemType,
           lootTableId: material.lootTableId,
           currentQuantity: material.quantity,
           quantityNeeded: recipe.requiredMaterials.find(r => r.lootTableId === material.lootTableId)?.quantity || 1,

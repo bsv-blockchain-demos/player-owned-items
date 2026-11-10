@@ -21,11 +21,26 @@ const materialFindOne = jest.fn(async (q: { _id: { toHexString(): string }; user
   return t && q.userId === 'u1' && t.lootTableId === q.lootTableId ? { _id: q._id, ...t } : null;
 });
 const listingFindOne = jest.fn(async (_filter: any): Promise<unknown> => null);
+// Minted item NFTs (artifact recipe inputs) keyed by inventory id.
+type OwnedItem = { lootTableId: string; tokenId: string };
+let ownedItems: Record<string, OwnedItem> = {};
+const inventoryFindOne = jest.fn(async (q: any) => {
+  const t = ownedItems[q._id.toHexString()];
+  return t && q.userId === 'u1' && t.lootTableId === q.lootTableId ? { _id: q._id, nftLootId: new ObjectId(), ...t } : null;
+});
+const inventoryDeleteOne = jest.fn(async (_filter: any) => ({ deletedCount: 1 }));
+const inventoryUpdateMany = jest.fn(async (filter: any, _update: any) => ({ modifiedCount: filter.$or?.length ?? 0 }));
 let playerLevel = 1;
-const playerStatsFindOne = jest.fn(async () => ({ userId: 'u1', level: playerLevel }));
+let equippedItems: Record<string, unknown> = {};
+const playerStatsFindOne = jest.fn(async () => ({ userId: 'u1', level: playerLevel, equippedItems }));
 jest.mock('@server/lib/mongodb', () => ({
   connectToMongo: jest.fn(async () => ({
-    userInventoryCollection: { insertOne: inventoryInsertOne },
+    userInventoryCollection: {
+      insertOne: inventoryInsertOne,
+      findOne: inventoryFindOne,
+      deleteOne: inventoryDeleteOne,
+      updateMany: inventoryUpdateMany,
+    },
     nftLootCollection: { insertOne: nftInsertOne },
     materialTokensCollection: {
       findOne: materialFindOne,
@@ -208,6 +223,10 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     nonceQueue = [];
     ownedTokens = defaultOwnedTokens();
     playerLevel = 1;
+    ownedItems = {};
+    equippedItems = {};
+    inventoryDeleteOne.mockResolvedValue({ deletedCount: 1 });
+    inventoryUpdateMany.mockImplementation(async (filter: any) => ({ modifiedCount: filter.$or?.length ?? 0 }));
   });
 
   afterEach(() => jest.restoreAllMocks());
@@ -602,5 +621,177 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     expect(nftInsertOne).not.toHaveBeenCalled();
     expect(inventoryInsertOne).not.toHaveBeenCalled();
     expect(materialDeleteOne).not.toHaveBeenCalled();
+  });
+
+  // craft_mana_elixir (level 4): 3 ectoplasm + 1 spirit_crystal (artifact NFT) + 2 pixie_dust.
+  describe('artifact inputs', () => {
+    const ECTO = '64b000000000000000000011';
+    const PIXIE = '64b000000000000000000012';
+    const CRYSTAL = '64b000000000000000000013';
+    const CRYSTAL_2 = '64b000000000000000000014';
+
+    const elixirBody = {
+      ...validBody,
+      recipeId: 'craft_mana_elixir',
+      transferredMaterials: [
+        { lootTableId: 'ectoplasm', tokenId: 'BATCHTX.0', materialTokenId: ECTO },
+        { lootTableId: 'pixie_dust', tokenId: 'BATCHTX.1', materialTokenId: PIXIE },
+      ],
+      transferredItems: [{ lootTableId: 'spirit_crystal', tokenId: 'BATCHTX.2', inventoryItemId: CRYSTAL }],
+    };
+    const elixirInputs = [
+      { sourceTXID: 'ECTOTX', sourceOutputIndex: 0 },
+      { sourceTXID: 'PIXIETX', sourceOutputIndex: 0 },
+      { sourceTXID: 'CRYSTALTX', sourceOutputIndex: 0 },
+    ];
+    const seedElixirBatch = (amts = [3, 2, 1], inputs = elixirInputs) =>
+      seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1', 'LOCK_PS_MARKER_2'], inputs, amts);
+    const itemClaimId = () => inventoryUpdateMany.mock.calls[0][1].$set.pendingClaim as string;
+
+    beforeEach(() => {
+      playerLevel = 4;
+      ownedTokens[ECTO] = { lootTableId: 'ectoplasm', tokenId: 'ECTOTX.0', quantity: 3, tier: 1 };
+      ownedTokens[PIXIE] = { lootTableId: 'pixie_dust', tokenId: 'PIXIETX.0', quantity: 2, tier: 1 };
+      ownedItems[CRYSTAL] = { lootTableId: 'spirit_crystal', tokenId: 'CRYSTALTX.0' };
+      ownedItems[CRYSTAL_2] = { lootTableId: 'spirit_crystal', tokenId: 'CRYSTAL2TX.0' };
+    });
+
+    it('400 without the artifact the recipe requires', async () => {
+      const res = await post({ ...elixirBody, transferredItems: [] });
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'Transferred materials do not match recipe craft_mana_elixir' });
+      expectNotClaimed();
+    });
+
+    it('400 with more artifacts than the recipe consumes', async () => {
+      const res = await post({
+        ...elixirBody,
+        transferredItems: [...elixirBody.transferredItems, { lootTableId: 'spirit_crystal', tokenId: 'BATCHTX.3', inventoryItemId: CRYSTAL_2 }],
+      });
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'Transferred materials do not match recipe craft_mana_elixir' });
+      expectNotClaimed();
+    });
+
+    it('400 when a material requirement is sent as an item', async () => {
+      const res = await post({
+        ...elixirBody,
+        transferredMaterials: [elixirBody.transferredMaterials[0]],
+        transferredItems: [...elixirBody.transferredItems, { lootTableId: 'pixie_dust', tokenId: 'BATCHTX.1', inventoryItemId: CRYSTAL_2 }],
+      });
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'Transferred materials do not match recipe craft_mana_elixir' });
+      expectNotClaimed();
+    });
+
+    it.each([
+      ['a malformed inventoryItemId', [{ lootTableId: 'spirit_crystal', tokenId: 'BATCHTX.2', inventoryItemId: { $ne: null } }]],
+      ['a batch outpoint already used by a material', [{ lootTableId: 'spirit_crystal', tokenId: 'BATCHTX.0', inventoryItemId: CRYSTAL }]],
+    ])('400 when transferredItems has %s', async (_label, transferredItems) => {
+      const res = await post({ ...elixirBody, transferredItems });
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'Invalid transferredItems' });
+      expectNotClaimed();
+    });
+
+    it('400 when the user does not own the minted artifact', async () => {
+      delete ownedItems[CRYSTAL];
+      const res = await post(elixirBody);
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'Item spirit_crystal not owned' });
+      expect(inventoryFindOne).toHaveBeenCalledWith({
+        _id: new ObjectId(CRYSTAL),
+        userId: 'u1',
+        lootTableId: 'spirit_crystal',
+        nftLootId: { $type: 'objectId' },
+        tokenId: { $type: 'string' },
+      });
+      expectNotClaimed();
+    });
+
+    it('409 when the artifact is equipped', async () => {
+      equippedItems = { accessory1: new ObjectId(CRYSTAL) };
+      const res = await post(elixirBody);
+      expect(res.status).toBe(409);
+      expect(res.body).toEqual({ error: 'Item spirit_crystal is equipped' });
+      expectNotClaimed();
+    });
+
+    it('400 when the batch transfer does not spend the owned artifact', async () => {
+      seedElixirBatch([3, 2, 1], [...elixirInputs.slice(0, 2), { sourceTXID: 'OTHERTX', sourceOutputIndex: 0 }]);
+      const res = await post(elixirBody);
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'Item spirit_crystal transfer does not spend owned token' });
+      expectNotClaimed();
+    });
+
+    it('400 when the artifact transfer does not carry amount 1', async () => {
+      seedElixirBatch([3, 2, 2]);
+      const res = await post(elixirBody);
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'Item spirit_crystal transfer must carry amount 1' });
+      expectNotClaimed();
+    });
+
+    it('409 when the artifact is listed on the marketplace', async () => {
+      seedElixirBatch();
+      listingFindOne
+        .mockResolvedValueOnce(null) // materials
+        .mockResolvedValueOnce({ _id: 'LISTING', inventoryItemId: CRYSTAL, status: 'active' });
+      const res = await post(elixirBody);
+      expect(res.status).toBe(409);
+      expect(res.body).toEqual({ error: 'Item is listed on the marketplace' });
+      expect(listingFindOne).toHaveBeenLastCalledWith({
+        inventoryItemId: { $in: [CRYSTAL] },
+        status: { $in: ['active', 'pending'] },
+      });
+      expectNotClaimed();
+      expect(inventoryUpdateMany).not.toHaveBeenCalled();
+    });
+
+    it('409 and releases the material claim when the artifact is already claimed', async () => {
+      seedElixirBatch();
+      inventoryUpdateMany.mockResolvedValueOnce({ modifiedCount: 0 });
+      const res = await post(elixirBody);
+      expect(res.status).toBe(409);
+      expect(res.body).toEqual({ error: 'Material tokens are already in use' });
+      expect(inventoryUpdateMany).toHaveBeenCalledWith(
+        { userId: 'u1', pendingClaim: { $exists: false }, $or: [{ _id: new ObjectId(CRYSTAL), tokenId: 'CRYSTALTX.0' }] },
+        { $set: { pendingClaim: expect.any(String) } },
+      );
+      expect(materialUpdateMany).toHaveBeenLastCalledWith({ pendingClaim: tokenClaimId() }, { $unset: { pendingClaim: '' } });
+      expect(enqueue).not.toHaveBeenCalled();
+    });
+
+    it('releases both claims when the wallet queue throws', async () => {
+      seedElixirBatch();
+      enqueue.mockRejectedValueOnce(new Error('craft boom'));
+      const res = await post(elixirBody);
+      expect(res.status).toBe(500);
+      expect(materialUpdateMany).toHaveBeenLastCalledWith({ pendingClaim: tokenClaimId() }, { $unset: { pendingClaim: '' } });
+      expect(inventoryUpdateMany).toHaveBeenLastCalledWith({ pendingClaim: itemClaimId() }, { $unset: { pendingClaim: '' } });
+      expect(inventoryDeleteOne).not.toHaveBeenCalled();
+    });
+
+    it('spends the artifact alongside the materials and deletes its inventory doc', async () => {
+      seedElixirBatch();
+      seedEnqueueMocks(3, ['N_MINT', 'N_ITEM']);
+
+      const res = await post(elixirBody);
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(expect.objectContaining({ success: true, dbRecorded: true, materialChangeTokens: [] }));
+      // The artifact is an input of the server's transfer, before the crafted item.
+      const transferInputs = stubWallet.createAction.mock.calls[1][0].inputs.map((i: { outpoint: string }) => i.outpoint);
+      expect(transferInputs).toEqual(['BATCHTX.0', 'BATCHTX.1', 'BATCHTX.2', 'MINTTX.0']);
+      expect(ordLock).toHaveBeenCalledWith(
+        'MINTKEY', '', expect.objectContaining({
+          craftingProof: { recipeId: 'craft_mana_elixir', materialTokens: ['BATCHTX.0', 'BATCHTX.1'], itemTokens: ['BATCHTX.2'] },
+        }), 'deploy+mint', 1,
+      );
+      expect(inventoryDeleteOne).toHaveBeenCalledWith({
+        _id: new ObjectId(CRYSTAL), userId: 'u1', tokenId: 'CRYSTALTX.0', pendingClaim: itemClaimId(),
+      });
+    });
   });
 });

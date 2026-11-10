@@ -2,7 +2,7 @@
 // derives mint quantities from them and claims them atomically, so concurrent
 // mints can't count the same units twice. Material tokens are claimed the same
 // way before any wallet action spends them.
-import { ObjectId, type Collection } from 'mongodb';
+import { ObjectId, type Collection, type Filter, type UpdateFilter } from 'mongodb';
 import type { UserInventory, MaterialToken, MarketplaceItem } from '@shared/types';
 import type { Tier } from '@shared/biome-config';
 
@@ -57,34 +57,43 @@ export async function consumeMaterialUnits(col: Collection<UserInventory>, claim
 
 export const TOKEN_CLAIM_FAILED = 'Material tokens are already in use';
 
+/** An on-chain token tracked in the DB: a MaterialToken or a minted UserInventory item. */
+type ClaimableToken = MaterialToken | UserInventory;
+
 /** Claims every token at its current outpoint, or none; returns the claim id, or null after releasing a partial claim. */
-export async function claimMaterialTokens(
-  col: Collection<MaterialToken>,
+export async function claimTokens<T extends ClaimableToken>(
+  col: Collection<T>,
   userId: string,
   tokens: Array<{ _id: ObjectId; tokenId: string }>,
 ): Promise<string | null> {
   const claimId = new ObjectId().toHexString();
+  if (tokens.length === 0) return claimId; // an empty $or is a query error
   const { modifiedCount } = await col.updateMany(
-    { userId, pendingClaim: { $exists: false }, $or: tokens.map(({ _id, tokenId }) => ({ _id, tokenId })) },
-    { $set: { pendingClaim: claimId } },
+    { userId, pendingClaim: { $exists: false }, $or: tokens.map(({ _id, tokenId }) => ({ _id, tokenId })) } as Filter<T>,
+    { $set: { pendingClaim: claimId } } as UpdateFilter<T>,
   );
   if (modifiedCount !== tokens.length) {
-    await releaseMaterialTokens(col, claimId);
+    await releaseTokens(col, claimId);
     return null;
   }
   return claimId;
 }
 
-export async function releaseMaterialTokens(col: Collection<MaterialToken>, claimId: string): Promise<void> {
-  await col.updateMany({ pendingClaim: claimId }, { $unset: { pendingClaim: '' } });
+export async function releaseTokens<T extends ClaimableToken>(col: Collection<T>, claimId: string): Promise<void> {
+  await col.updateMany({ pendingClaim: claimId } as Filter<T>, { $unset: { pendingClaim: '' } } as unknown as UpdateFilter<T>);
 }
 
 export const TOKEN_LISTED = 'Material token is listed on the marketplace';
+export const ITEM_LISTED = 'Item is listed on the marketplace';
 
-/** True if any of the tokens has a live (active or mid-purchase) marketplace listing. */
-export async function anyTokenListed(col: Collection<MarketplaceItem>, ids: ObjectId[]): Promise<boolean> {
+/** True if any of the docs has a live (active or mid-purchase) marketplace listing. */
+export async function anyTokenListed(
+  col: Collection<MarketplaceItem>,
+  ids: ObjectId[],
+  field: 'materialTokenId' | 'inventoryItemId' = 'materialTokenId',
+): Promise<boolean> {
   const listing = await col.findOne({
-    materialTokenId: { $in: ids.map((id) => id.toHexString()) },
+    [field]: { $in: ids.map((id) => id.toHexString()) },
     status: { $in: ['active', 'pending'] },
   });
   return listing !== null;

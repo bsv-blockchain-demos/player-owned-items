@@ -10,7 +10,7 @@ import { requireSession } from '@server/middleware/requireSession';
 export const inventoryRouter = Router();
 
 // Fetch the user's inventory, optionally filtered to minted-only items and/or
-// excluding items currently escrowed in an active marketplace listing.
+// excluding items currently escrowed in an active marketplace listing or equipped.
 inventoryRouter.get('/get', requireSession, async (req: Request, res: Response) => {
   try {
     const userId = req.userId as string;
@@ -18,21 +18,28 @@ inventoryRouter.get('/get', requireSession, async (req: Request, res: Response) 
     // Check query parameters
     const mintedOnly = req.query.mintedOnly === 'true';
     const excludeListed = req.query.excludeListed === 'true';
+    const excludeEquipped = req.query.excludeEquipped === 'true';
 
     // Ensure MongoDB is connected and get collections
-    const { userInventoryCollection, nftLootCollection, materialTokensCollection, marketplaceItemsCollection } = await connectToMongo();
+    const { userInventoryCollection, nftLootCollection, materialTokensCollection, marketplaceItemsCollection, playerStatsCollection } =
+      await connectToMongo();
 
     // Items with an active listing are escrowed in an orderLock and not sellable again
-    const listedInventoryIds = new Set<string>();
+    const excludedInventoryIds = new Set<string>();
     const listedMaterialIds = new Set<string>();
     if (excludeListed) {
       const activeListings = await marketplaceItemsCollection
         .find({ sellerId: userId, status: 'active' })
         .toArray();
       for (const l of activeListings) {
-        if (l.inventoryItemId) listedInventoryIds.add(l.inventoryItemId);
+        if (l.inventoryItemId) excludedInventoryIds.add(l.inventoryItemId);
         if (l.materialTokenId) listedMaterialIds.add(l.materialTokenId);
       }
+    }
+    // Crafting can't consume an equipped item.
+    if (excludeEquipped) {
+      const playerStats = await playerStatsCollection.findOne({ userId });
+      for (const id of Object.values(playerStats?.equippedItems ?? {})) if (id) excludedInventoryIds.add(String(id));
     }
 
     // Build query for inventory items
@@ -47,7 +54,7 @@ inventoryRouter.get('/get', requireSession, async (req: Request, res: Response) 
       .find(inventoryQuery)
       .sort({ acquiredAt: -1 }) // Most recent first
       .toArray())
-      .filter(item => !listedInventoryIds.has(item._id!.toString()));
+      .filter(item => !excludedInventoryIds.has(item._id!.toString()));
 
     // Build query for material tokens
     const materialTokenQuery: any = { userId, consumed: { $ne: true } };
