@@ -24,8 +24,13 @@ jest.mock('@server/lib/mongodb', () => ({
   })),
 }));
 
+// The server wallet's own action history is the proof of a server mint.
+const listActions = jest.fn(async (_args: any): Promise<{ totalActions: number; actions: Array<{ txid: string; status: string }> }> => ({
+  totalActions: 1,
+  actions: [{ txid: 'MINTTX', status: 'completed' }],
+}));
 jest.mock('@server/lib/serverWallet', () => ({
-  getServerWallet: jest.fn(async () => ({})),
+  getServerWallet: jest.fn(async () => ({ listActions })),
   getServerIdentityPublicKey: jest.fn(async () => 'SERVER_ID'),
 }));
 jest.mock('@shared/tokenDerivation', () => ({
@@ -67,6 +72,26 @@ describe('POST /api/items/mint-and-transfer/record', () => {
     jest.clearAllMocks();
     insertOne.mockResolvedValue({ insertedId: 'NFT_OID' });
     materialFindOne.mockResolvedValue(null);
+    listActions.mockResolvedValue({ totalActions: 1, actions: [{ txid: 'MINTTX', status: 'completed' }] });
+  });
+
+  it.each([
+    ['has no mint action for this item (a user-made lock: BRC-42 lets the user derive it too)', []],
+    ['only has a failed mint action for this tx', [{ txid: 'MINTTX', status: 'failed' }]],
+    ['only has a mint action for another tx', [{ txid: 'OTHERTX', status: 'completed' }]],
+  ])('400 when the server wallet %s', async (_label, actions) => {
+    findOne.mockResolvedValueOnce({ lootTableId: 'lt1', itemType: 'weapon' });
+    fromAtomicBEEF.mockReturnValueOnce(goodTx());
+    listActions.mockResolvedValueOnce({ totalActions: actions.length, actions });
+
+    const res = await request(buildApp())
+      .post('/api/items/mint-and-transfer/record')
+      .send({ ...body, inventoryItemId: body.inventoryItemId.toUpperCase() });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Not a server mint for this item' });
+    expect(listActions).toHaveBeenCalledWith({ labels: ['mint item 507f1f77bcf86cd799439011'], limit: 100 });
+    expect(insertOne).not.toHaveBeenCalled();
   });
 
   it.each([

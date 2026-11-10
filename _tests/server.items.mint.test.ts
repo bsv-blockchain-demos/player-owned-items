@@ -128,6 +128,8 @@ describe('POST /api/items/mint-and-transfer', () => {
     expect(enqueue).toHaveBeenCalledWith('mint:item', expect.any(Function));
     expect(stubWallet.createAction).toHaveBeenCalledTimes(1);
     expect(stubWallet.signAction).toHaveBeenCalledTimes(1);
+    // /record accepts only mints the server wallet's history shows under this label.
+    expect(stubWallet.createAction).toHaveBeenCalledWith(expect.objectContaining({ labels: ['mint item 507f1f77bcf86cd799439011'] }));
 
     // DB writes happened AFTER the enqueue resolved.
     expect(insertOne).toHaveBeenCalledTimes(1);
