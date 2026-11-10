@@ -75,7 +75,8 @@ jest.mock('@shared/tokenDerivation', () => ({
   deriveRecipientKey: jest.fn(async () => 'USERKEY'),
   deriveSelfKey: jest.fn(async () => 'MINTKEY'),
 }));
-const ordLock = jest.fn((..._args: unknown[]) => ({ toHex: () => 'LOCKHEX' }));
+// The "hex" is the inscription the route asked for, so a test can rebuild the tx it made.
+const ordLock = jest.fn((...args: unknown[]) => ({ toHex: () => JSON.stringify({ op: args[3], amt: args[4], id: args[1] || undefined }) }));
 jest.mock('@shared/ordinalP2PKH', () => ({
   OrdinalsP2PKH: class {
     lock(...args: unknown[]) { return ordLock(...args); }
@@ -94,7 +95,7 @@ jest.mock('@bsv/sdk', () => ({
 }));
 
 import request from 'supertest';
-import { inscribedScript } from './helpers/ordinalScript';
+import { inscribedScript, tokenInput, sourceOutput } from './helpers/ordinalScript';
 import { ObjectId } from 'mongodb';
 import { buildApp } from '@server/app';
 import { Transaction } from '@bsv/sdk';
@@ -143,8 +144,8 @@ const defaultOwnedTokens = (): Record<string, OwnedToken> => ({
   [WOOD_T3]: { lootTableId: 'common_wood', tokenId: 'WOODT3TX.0', quantity: 4, tier: 3, mintOutpoint: 'WOODT3MINT.0' },
 });
 const defaultBatchInputs = [
-  { sourceTXID: 'WOODTX', sourceOutputIndex: 0 },
-  { sourceTXID: 'LEATHERTX', sourceOutputIndex: 0 },
+  tokenInput('WOODTX', 0, { op: 'transfer', amt: 7, id: 'WOODMINT_0' }),
+  tokenInput('LEATHERTX', 0, { op: 'transfer', amt: 2, id: 'LEATHERMINT_0' }),
 ];
 
 const inscribed = (hex: string, amt: number, lootTableId: string, assetId: string) => inscribedScript(hex, amt, { lootTableId }, assetId);
@@ -152,7 +153,7 @@ const inscribed = (hex: string, amt: number, lootTableId: string, assetId: strin
 /** payment tx + batch-transfer tx — reached by every request past field validation. */
 function seedPaymentAndBatchMocks(
   scriptHexes: string[],
-  inputs = defaultBatchInputs,
+  inputs: unknown[] = defaultBatchInputs,
   amts = [7, 2],
   lootIds = ['common_wood', 'common_leather'],
   assetIds = ['WOODMINT_0', 'LEATHERMINT_0'],
@@ -356,7 +357,7 @@ describe('POST /api/crafting/mint-and-transfer', () => {
 
   it('400 when the batch transfer does not spend the owned material token', async () => {
     seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1'], [
-      { sourceTXID: 'WOODTX', sourceOutputIndex: 0 },
+      defaultBatchInputs[0],
       { sourceTXID: 'SOMEOTHERTX', sourceOutputIndex: 3 },
     ]);
     const res = await post(validBody);
@@ -434,6 +435,37 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     seedEnqueueMocks();
     const res = await post(validBody);
     expect(res.status).toBe(200);
+  });
+
+  // The spent output itself must be this token on chain, as the DB doc records it.
+  it.each([
+    ['another asset', { op: 'transfer' as const, amt: 2, id: 'OTHERMINT_0' }],
+    ['another amount (DB drifted from chain)', { op: 'transfer' as const, amt: 9, id: 'LEATHERMINT_0' }],
+    ['a deploy+mint away from the recorded mint outpoint', { op: 'deploy+mint' as const, amt: 2 }],
+  ])('400 when the spent output is %s', async (_label, source) => {
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1'], [defaultBatchInputs[0], tokenInput('LEATHERTX', 0, source)]);
+    const res = await post(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Material common_leather spends an output that is not this token on chain' });
+    expectNotClaimed();
+  });
+
+  it('accepts a token still at its mint outpoint (its source is the deploy+mint)', async () => {
+    ownedTokens[LEATHER].tokenId = 'LEATHERMINT.0';
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1'], [
+      defaultBatchInputs[0],
+      tokenInput('LEATHERMINT', 0, { op: 'deploy+mint', amt: 2 }),
+    ]);
+    seedEnqueueMocks();
+    const res = await post(validBody);
+    expect(res.status).toBe(200);
+  });
+
+  it('400 when the BEEF does not carry the spent output\'s source tx', async () => {
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1'], [defaultBatchInputs[0], { sourceTXID: 'LEATHERTX', sourceOutputIndex: 0 }]);
+    const res = await post(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Material common_leather spends an output that is not this token on chain' });
   });
 
   it('400 when the owned token has no recorded mint', async () => {
@@ -651,9 +683,9 @@ describe('POST /api/crafting/mint-and-transfer', () => {
       ],
     };
     seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1', 'LOCK_PS_MARKER_2'], [
-      { sourceTXID: 'WOODTX', sourceOutputIndex: 0 },
-      { sourceTXID: 'WOODT3TX', sourceOutputIndex: 0 },
-      { sourceTXID: 'LEATHERTX', sourceOutputIndex: 0 },
+      tokenInput('WOODTX', 0, { op: 'transfer', amt: 3, id: 'WOODMINT_0' }),
+      tokenInput('WOODT3TX', 0, { op: 'transfer', amt: 4, id: 'WOODT3MINT_0' }),
+      defaultBatchInputs[1],
     ], [3, 4, 2], ['common_wood', 'common_wood', 'common_leather'], ['WOODMINT_0', 'WOODT3MINT_0', 'LEATHERMINT_0']);
     seedEnqueueMocks(3);
 
@@ -679,9 +711,42 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     );
   });
 
+  it('accepts its own material change as the owned token in the next craft', async () => {
+    // Craft 1: 12 wood - 5 = 7 wood returned as change.
+    ownedTokens[WOOD].quantity = 12;
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1'], [
+      tokenInput('WOODTX', 0, { op: 'transfer', amt: 12, id: 'WOODMINT_0' }),
+      defaultBatchInputs[1],
+    ], [12, 2]);
+    seedEnqueueMocks();
+    expect((await post(validBody)).status).toBe(200);
+
+    // The doc the route wrote back, and the craft tx as the route built it (outputs in order).
+    const { $set } = materialUpdateOne.mock.calls[0][1];
+    ownedTokens[WOOD] = { ...ownedTokens[WOOD], tokenId: $set.tokenId, quantity: $set.quantity };
+    const craftTx = {
+      outputs: stubWallet.createAction.mock.calls[1][0].outputs.map((o: { lockingScript: string }) => sourceOutput(JSON.parse(o.lockingScript))),
+    };
+    const [txid, vout] = $set.tokenId.split('.');
+
+    // Craft 2 spends that change; the source-output check reads it from the craft tx.
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1'], [
+      { sourceTXID: txid, sourceOutputIndex: Number(vout), sourceTransaction: craftTx },
+      defaultBatchInputs[1],
+    ], [7, 2]);
+    seedEnqueueMocks();
+    const res = await post(validBody);
+
+    expect(res.status).toBe(200);
+    expect(res.body.materialChangeTokens).toEqual([{ lootTableId: 'common_wood', tokenId: 'TRANSFERTX.1', quantity: 2 }]);
+  });
+
   it('signs only its own inputs when the wallet adds funding inputs (every stack has change)', async () => {
     ownedTokens[LEATHER].quantity = 3; // 3 - 2 = 1 change; wood 7 - 5 = 2 change: no 1-sat input is freed for the fee
-    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1'], defaultBatchInputs, [7, 3]);
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1'], [
+      defaultBatchInputs[0],
+      tokenInput('LEATHERTX', 0, { op: 'transfer', amt: 3, id: 'LEATHERMINT_0' }),
+    ], [7, 3]);
     seedEnqueueMocks(2, ['N_MINT', 'N_ITEM', 'N_CHANGE_1', 'N_CHANGE_2'], 1);
 
     const res = await post(validBody);
@@ -724,13 +789,13 @@ describe('POST /api/crafting/mint-and-transfer', () => {
       transferredItems: [{ lootTableId: 'spirit_crystal', tokenId: 'BATCHTX.2', inventoryItemId: CRYSTAL }],
     };
     const elixirInputs = [
-      { sourceTXID: 'ECTOTX', sourceOutputIndex: 0 },
-      { sourceTXID: 'PIXIETX', sourceOutputIndex: 0 },
-      { sourceTXID: 'CRYSTALTX', sourceOutputIndex: 0 },
+      tokenInput('ECTOTX', 0, { op: 'transfer', amt: 3, id: 'ECTOMINT_0' }),
+      tokenInput('PIXIETX', 0, { op: 'transfer', amt: 2, id: 'PIXIEMINT_0' }),
+      tokenInput('CRYSTALTX', 0, { op: 'transfer', amt: 1, id: 'CRYSTALMINT_0' }),
     ];
     const seedElixirBatch = (
       amts = [3, 2, 1],
-      inputs = elixirInputs,
+      inputs: unknown[] = elixirInputs,
       lootIds = ['ectoplasm', 'pixie_dust', 'spirit_crystal'],
       assetIds = ['ECTOMINT_0', 'PIXIEMINT_0', 'CRYSTALMINT_0'],
     ) => seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1', 'LOCK_PS_MARKER_2'], inputs, amts, lootIds, assetIds);

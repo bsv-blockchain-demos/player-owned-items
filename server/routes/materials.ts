@@ -32,7 +32,7 @@ import {
   mergeableStackFilter,
 } from '@server/lib/materialUnits';
 import { transferAmount, inscribedLootTableId, inscribedAssetId, mintAssetId } from '@server/lib/tokenScript';
-import { inputOutpoint, strayAssetOutput } from '@server/lib/batchTransfer';
+import { inputOutpoint, strayAssetOutput, spendsRecordedToken } from '@server/lib/batchTransfer';
 
 const CLAIM_FAILED = 'Inventory items missing or already being minted';
 
@@ -490,6 +490,10 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
   const namedAssetId = inscribedAssetId(transferOutput.lockingScript);
   if (namedAssetId !== stackAssetId) {
     res.status(400).json({ error: `Transfer names asset ${namedAssetId ?? 'none'}, not the stack's mint ${stackAssetId}` });
+    return;
+  }
+  if (!spendsRecordedToken(pairedInput!, existingToken.mintOutpoint!, existingToken.quantity)) {
+    res.status(400).json({ error: 'Transfer spends an output that is not the stack on chain' });
     return;
   }
   const stray = strayAssetOutput(transferTransaction, new Set([transferOutputIndex]), new Set([stackAssetId]));

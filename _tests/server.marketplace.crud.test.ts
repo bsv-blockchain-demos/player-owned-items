@@ -535,9 +535,15 @@ describe('POST /api/marketplace/cancel-listing', () => {
     ...over,
   });
   // The listing's assetId is the token's mint id (set by list-item from mintOutpoint).
+  // The spent OrdLock's source script must be the listing's (BEEF links the source tx).
+  const ordLockInput = (script = 'ORDSCRIPT_HEX') => ({
+    sourceTXID: 'CANCELSRC',
+    sourceOutputIndex: 0,
+    sourceTransaction: { outputs: [{ lockingScript: { toHex: () => script } }] },
+  });
   const cancelTx = (lock = SELLER_LOCK, amt = 1, satoshis = 1, lootTableId = 'common_dagger', assetId = 'ASSET1') => ({
     id: () => 'RETURNTX',
-    inputs: [{ sourceTXID: 'CANCELSRC', sourceOutputIndex: 0 }],
+    inputs: [ordLockInput()],
     outputs: [{ satoshis, lockingScript: inscribed(lock, amt, lootTableId, assetId) }],
   });
   const send = async (body: Record<string, unknown>) =>
@@ -614,6 +620,18 @@ describe('POST /api/marketplace/cancel-listing', () => {
 
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Return output is not paired with the listing ordLockOutpoint input' });
+    expect(itemsUpdateOne).not.toHaveBeenCalled();
+  });
+
+  it('400s when the spent output is not the listing\'s OrdLock script', async () => {
+    seedValidProof();
+    itemsFindOne.mockResolvedValueOnce(listing());
+    fromBEEF.mockReturnValueOnce({ ...cancelTx(), inputs: [ordLockInput('SOME_OTHER_SCRIPT')] });
+
+    const res = await send(fullBody);
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Cancel spends an output that is not the listing OrdLock' });
     expect(itemsUpdateOne).not.toHaveBeenCalled();
   });
 

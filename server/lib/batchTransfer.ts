@@ -7,11 +7,25 @@ import { P2PKH, Hash, type Transaction, type WalletInterface } from '@bsv/sdk';
 import { TOKEN_PROTOCOL } from '@shared/tokenDerivation';
 import { getServerPublicKey } from '@server/lib/serverWallet';
 import { voutOf } from '@server/lib/materialUnits';
-import { transferAmount, inscribedLootTableId, inscribedAssetId, mintAssetId } from '@server/lib/tokenScript';
+import { transferAmount, inscribedLootTableId, inscribedAssetId, mintAssetId, bsv20Inscription } from '@server/lib/tokenScript';
 
 /** The outpoint a transaction input spends. */
 export function inputOutpoint(input: Transaction['inputs'][number]): string {
   return `${input.sourceTXID || input.sourceTransaction?.id('hex')}.${input.sourceOutputIndex}`;
+}
+
+/**
+ * Whether the output `input` spends (its source tx, as the BEEF links it) is the token the DB
+ * doc records: its deploy+mint if it still sits at the mint outpoint, else a transfer of its
+ * asset id, holding `amount` units either way. Catches a doc that drifted from the chain.
+ */
+export function spendsRecordedToken(input: Transaction['inputs'][number], mintOutpoint: string, amount: number): boolean {
+  const source = input.sourceTransaction?.outputs[input.sourceOutputIndex];
+  const ins = source ? bsv20Inscription(source.lockingScript) : null;
+  if (!ins || ins.amt !== amount) return false;
+  return inputOutpoint(input) === mintOutpoint
+    ? ins.op === 'deploy+mint'
+    : ins.op === 'transfer' && ins.id === mintAssetId(mintOutpoint);
 }
 
 /**
@@ -84,6 +98,9 @@ export function checkBatchTransfer(
     if (inscribed !== e.lootTableId) return { status: 400, error: `${e.label} transfer is inscribed as ${inscribed ?? 'no lootTableId'}` };
     const named = inscribedAssetId(output.lockingScript);
     if (named !== assetId) return { status: 400, error: `${e.label} transfer names asset ${named ?? 'none'}, not its mint ${assetId}` };
+    if (!spendsRecordedToken(paired, e.mintOutpoint!, e.amount)) {
+      return { status: 400, error: `${e.label} spends an output that is not this token on chain` };
+    }
     namedVouts.add(vout);
     assetIds.add(assetId);
   }

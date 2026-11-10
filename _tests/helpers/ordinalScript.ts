@@ -10,15 +10,31 @@ const pushed = (data: number[]) =>
     : data.length < 0x100 ? [0x4c, data.length, ...data]
       : [0x4d, data.length & 0xff, data.length >> 8, ...data];
 
+type Bsv20 = { op: 'transfer' | 'deploy+mint'; amt: number; id?: string };
+
+const ordScript = (hex: string, inscription: Bsv20, metadata: Record<string, unknown>) => ({
+  toHex: () => hex,
+  chunks: [
+    { op: 0 }, { op: 0x63 }, { op: 3, data: bytes('ord') }, { op: 0x51 },
+    { op: 18, data: bytes('application/bsv-20') }, { op: 0 },
+    { op: 1, data: bytes(JSON.stringify({ p: 'bsv-20', ...inscription })) },
+    { op: 0x68 },
+    { op: 0x6a, data: pushed(bytes(JSON.stringify({ app: 'monsterbattle', type: 'ord', ...metadata }))) },
+  ],
+});
+
 export function inscribedScript(hex: string, amt: number, metadata: Record<string, unknown>, assetId?: string) {
-  return {
-    toHex: () => hex,
-    chunks: [
-      { op: 0 }, { op: 0x63 }, { op: 3, data: bytes('ord') }, { op: 0x51 },
-      { op: 18, data: bytes('application/bsv-20') }, { op: 0 },
-      { op: 1, data: bytes(JSON.stringify({ p: 'bsv-20', op: 'transfer', amt, id: assetId })) },
-      { op: 0x68 },
-      { op: 0x6a, data: pushed(bytes(JSON.stringify({ app: 'monsterbattle', type: 'ord', ...metadata }))) },
-    ],
-  };
+  return ordScript(hex, { op: 'transfer', amt, id: assetId }, metadata);
+}
+
+/** A source-tx output holding a token script with `inscription`. */
+export function sourceOutput(inscription: Bsv20) {
+  return { lockingScript: ordScript('SOURCE', inscription, {}) };
+}
+
+/** A tx input spending txid.vout, with the source tx (as BEEF links it) holding a token script there. */
+export function tokenInput(txid: string, vout: number, inscription: Bsv20) {
+  const outputs: Array<ReturnType<typeof sourceOutput>> = [];
+  outputs[vout] = sourceOutput(inscription);
+  return { sourceTXID: txid, sourceOutputIndex: vout, sourceTransaction: { outputs } };
 }

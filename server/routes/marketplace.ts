@@ -1028,6 +1028,12 @@ marketplaceRouter.post('/cancel-listing', requireAuthProof('cancel'), async (req
       res.status(400).json({ error: 'Return output is not paired with the listing ordLockOutpoint input' });
       return;
     }
+    // The spent output (its source tx, as the BEEF links it) must be the OrdLock list-item verified.
+    const spentScript = pairedInput.sourceTransaction?.outputs[pairedInput.sourceOutputIndex]?.lockingScript.toHex();
+    if (spentScript !== listing.ordLockScript) {
+      res.status(400).json({ error: 'Cancel spends an output that is not the listing OrdLock' });
+      return;
+    }
 
     const output = cancelTx.outputs[returnVout];
     if (!output || (output.satoshis || 0) !== 1) {

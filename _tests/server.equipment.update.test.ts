@@ -68,7 +68,7 @@ jest.mock('@bsv/sdk', () => ({
 }));
 
 import request from 'supertest';
-import { inscribedScript } from './helpers/ordinalScript';
+import { inscribedScript, tokenInput } from './helpers/ordinalScript';
 import { buildApp } from '@server/app';
 import { ObjectId } from 'mongodb';
 import { Transaction } from '@bsv/sdk';
@@ -113,15 +113,15 @@ const validBody = {
 
 const inscribed = (hex: string, amt: number, lootTableId: string, assetId: string) => inscribedScript(hex, amt, { lootTableId }, assetId);
 const defaultInputs = [
-  { sourceTXID: 'ORIGTX', sourceOutputIndex: 0 },
-  { sourceTXID: 'SCROLLPTX', sourceOutputIndex: 0 },
-  { sourceTXID: 'SCROLLSTX', sourceOutputIndex: 0 },
+  tokenInput('ORIGTX', 0, { op: 'transfer', amt: 1, id: 'ORIGMINT_0' }),
+  tokenInput('SCROLLPTX', 0, { op: 'transfer', amt: 1, id: 'SCROLLPMINT_0' }),
+  tokenInput('SCROLLSTX', 0, { op: 'transfer', amt: 1, id: 'SCROLLSMINT_0' }),
 ];
 
 /** payment tx + batch-transfer tx — reached by every request past the DB checks. */
 function seedPaymentAndBatchMocks(
   scripts = ['LOCK_PS_0', 'LOCK_PS_1', 'LOCK_PS_2'],
-  inputs = defaultInputs,
+  inputs: unknown[] = defaultInputs,
   amts = [1, 1, 1],
   lootIds = ['common_dagger', 'prefix_damage_common', 'suffix_damage_common'],
   assetIds = ['ORIGMINT_0', 'SCROLLPMINT_0', 'SCROLLSMINT_0'],
@@ -334,6 +334,14 @@ describe('POST /api/equipment/update', () => {
     const res = await post(validBody);
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Output 3 also carries asset SCROLLPMINT_0' });
+    expectNotClaimed();
+  });
+
+  it('400 when a spent scroll output is another asset on chain', async () => {
+    seedPaymentAndBatchMocks(undefined, [...defaultInputs.slice(0, 2), tokenInput('SCROLLSTX', 0, { op: 'transfer', amt: 1, id: 'OTHERMINT_0' })]);
+    const res = await post(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Scroll suffix_damage_common spends an output that is not this token on chain' });
     expectNotClaimed();
   });
 
