@@ -170,6 +170,7 @@ export function useUpdateEquipmentNFT() {
         equipmentAssetId,
         {
           name: 'game_item',
+          lootTableId: equipmentItem.lootTableId, // the server checks this against the item's DB doc
           itemName: equipmentItem.name,
           description: equipmentItem.description,
           icon: equipmentItem.icon,
@@ -198,6 +199,7 @@ export function useUpdateEquipmentNFT() {
           scrollAssetId,
           {
             name: 'inscription_scroll',
+            lootTableId: scroll.lootTableId, // the server checks this against the scroll's DB doc
             itemName: scroll.name,
             description: scroll.description,
             icon: scroll.icon,

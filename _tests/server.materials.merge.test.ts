@@ -60,6 +60,7 @@ jest.mock('@bsv/sdk', () => ({
 }));
 
 import request from 'supertest';
+import { inscribedScript } from './helpers/ordinalScript';
 import { ObjectId } from 'mongodb';
 import { buildApp } from '@server/app';
 import { Transaction } from '@bsv/sdk';
@@ -93,31 +94,23 @@ const validBody = {
 };
 
 const EXISTING_OID = new ObjectId('64b0000000000000000000aa');
-const ownedToken = { _id: EXISTING_OID, quantity: 5, tokenId: 'USERTOKEN.0' };
+const ownedToken = { _id: EXISTING_OID, lootTableId: 'phoenix_feather', tier: 1, quantity: 5, tokenId: 'USERTOKEN.0' };
 
-/** Locking script whose chunks carry a bsv-20 transfer inscription, as OrdinalsP2PKH lays them out. */
-const bytes = (text: string) => [...Buffer.from(text, 'utf8')];
-const inscribed = (hex: string, amt: number) => ({
-  toHex: () => hex,
-  chunks: [
-    { op: 0 }, { op: 0x63 }, { op: 3, data: bytes('ord') }, { op: 0x51 },
-    { op: 18, data: bytes('application/bsv-20') }, { op: 0 },
-    { op: 1, data: bytes(JSON.stringify({ p: 'bsv-20', op: 'transfer', amt, id: 'USERTOKEN_0' })) },
-  ],
-});
+const inscribed = (hex: string, amt: number, lootTableId: string) => inscribedScript(hex, amt, { lootTableId });
 
 /** payment tx + transfer tx — reached by every request past field validation. */
 function seedPaymentAndTransferMocks(
   transferScriptHex: string,
   inputs = [{ sourceTXID: 'USERTOKEN', sourceOutputIndex: 0 }],
   amt = 5,
+  lootTableId = 'phoenix_feather',
 ) {
   (Transaction.fromBEEF as jest.Mock)
     .mockReturnValueOnce({ id: () => 'PAYTXID', outputs: [{ satoshis: 100 }] })
     .mockReturnValueOnce({
       id: () => 'TXID1',
       inputs,
-      outputs: [{ lockingScript: inscribed(transferScriptHex, amt) }],
+      outputs: [{ lockingScript: inscribed(transferScriptHex, amt, lootTableId) }],
       toBEEF: () => [1, 1],
     });
 }
@@ -274,6 +267,15 @@ describe('POST /api/materials/add-and-merge', () => {
     const res = await request(buildApp()).post('/api/materials/add-and-merge').send(validBody);
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Transfer must carry the full token quantity (5)' });
+    expect(tokenUpdateMany).not.toHaveBeenCalled();
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('400 when the transfer is inscribed as another material than the owned token', async () => {
+    seedPaymentAndTransferMocks('LOCKSCRIPT_CONTAINS_PS_MARKER', undefined, 5, 'common_wood');
+    const res = await request(buildApp()).post('/api/materials/add-and-merge').send(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Transfer is inscribed as common_wood' });
     expect(tokenUpdateMany).not.toHaveBeenCalled();
     expect(enqueue).not.toHaveBeenCalled();
   });

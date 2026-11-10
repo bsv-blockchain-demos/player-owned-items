@@ -94,6 +94,7 @@ jest.mock('@bsv/sdk', () => ({
 }));
 
 import request from 'supertest';
+import { inscribedScript } from './helpers/ordinalScript';
 import { ObjectId } from 'mongodb';
 import { buildApp } from '@server/app';
 import { Transaction } from '@bsv/sdk';
@@ -146,25 +147,16 @@ const defaultBatchInputs = [
   { sourceTXID: 'LEATHERTX', sourceOutputIndex: 0 },
 ];
 
-/** Locking script whose chunks carry a bsv-20 transfer inscription, as OrdinalsP2PKH lays them out. */
-const bytes = (text: string) => [...Buffer.from(text, 'utf8')];
-const inscribed = (hex: string, amt: number) => ({
-  toHex: () => hex,
-  chunks: [
-    { op: 0 }, { op: 0x63 }, { op: 3, data: bytes('ord') }, { op: 0x51 },
-    { op: 18, data: bytes('application/bsv-20') }, { op: 0 },
-    { op: 1, data: bytes(JSON.stringify({ p: 'bsv-20', op: 'transfer', amt, id: 'ANY_0' })) },
-  ],
-});
+const inscribed = (hex: string, amt: number, lootTableId: string) => inscribedScript(hex, amt, { lootTableId });
 
 /** payment tx + batch-transfer tx — reached by every request past field validation. */
-function seedPaymentAndBatchMocks(scriptHexes: string[], inputs = defaultBatchInputs, amts = [7, 2]) {
+function seedPaymentAndBatchMocks(scriptHexes: string[], inputs = defaultBatchInputs, amts = [7, 2], lootIds = ['common_wood', 'common_leather']) {
   (Transaction.fromBEEF as jest.Mock)
     .mockReturnValueOnce({ id: () => 'PAYTXID', outputs: [{ satoshis: 100 }] })
     .mockReturnValueOnce({
       id: () => 'BATCHTX',
       inputs,
-      outputs: scriptHexes.map((hex, i) => ({ lockingScript: inscribed(hex, amts[i]) })),
+      outputs: scriptHexes.map((hex, i) => ({ lockingScript: inscribed(hex, amts[i], lootIds[i]) })),
       toBEEF: () => [1, 1],
     });
 }
@@ -381,6 +373,18 @@ describe('POST /api/crafting/mint-and-transfer', () => {
     expectNotClaimed();
   });
 
+  // The DB doc decides what the token is; the on-chain record must say the same.
+  it.each([
+    ['names another material', ['common_wood', 'rare_steel'], 'Material common_leather transfer is inscribed as rare_steel'],
+    ['names no material', ['common_wood', undefined], 'Material common_leather transfer is inscribed as no lootTableId'],
+  ])('400 when a transfer\'s metadata %s', async (_label, lootIds, error) => {
+    seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1'], defaultBatchInputs, [7, 2], lootIds as string[]);
+    const res = await post(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error });
+    expectNotClaimed();
+  });
+
   it('400 when a transfer output does not carry the whole owned token (on-chain split)', async () => {
     seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1'], defaultBatchInputs, [7, 1]);
     const res = await post(validBody);
@@ -589,7 +593,7 @@ describe('POST /api/crafting/mint-and-transfer', () => {
       { sourceTXID: 'WOODTX', sourceOutputIndex: 0 },
       { sourceTXID: 'WOODT3TX', sourceOutputIndex: 0 },
       { sourceTXID: 'LEATHERTX', sourceOutputIndex: 0 },
-    ], [3, 4, 2]);
+    ], [3, 4, 2], ['common_wood', 'common_wood', 'common_leather']);
     seedEnqueueMocks(3);
 
     const res = await post(body);
@@ -663,8 +667,8 @@ describe('POST /api/crafting/mint-and-transfer', () => {
       { sourceTXID: 'PIXIETX', sourceOutputIndex: 0 },
       { sourceTXID: 'CRYSTALTX', sourceOutputIndex: 0 },
     ];
-    const seedElixirBatch = (amts = [3, 2, 1], inputs = elixirInputs) =>
-      seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1', 'LOCK_PS_MARKER_2'], inputs, amts);
+    const seedElixirBatch = (amts = [3, 2, 1], inputs = elixirInputs, lootIds = ['ectoplasm', 'pixie_dust', 'spirit_crystal']) =>
+      seedPaymentAndBatchMocks(['LOCK_PS_MARKER_0', 'LOCK_PS_MARKER_1', 'LOCK_PS_MARKER_2'], inputs, amts, lootIds);
     const itemClaimId = () => inventoryUpdateMany.mock.calls[0][1].$set.pendingClaim as string;
 
     beforeEach(() => {
@@ -749,6 +753,14 @@ describe('POST /api/crafting/mint-and-transfer', () => {
       const res = await post(elixirBody);
       expect(res.status).toBe(400);
       expect(res.body).toEqual({ error: 'Item spirit_crystal transfer must carry amount 1' });
+      expectNotClaimed();
+    });
+
+    it('400 when the artifact transfer is inscribed as another item', async () => {
+      seedElixirBatch(undefined, undefined, ['ectoplasm', 'pixie_dust', 'soul_stone']);
+      const res = await post(elixirBody);
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'Item spirit_crystal transfer is inscribed as soul_stone' });
       expectNotClaimed();
     });
 

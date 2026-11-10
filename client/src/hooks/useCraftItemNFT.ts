@@ -184,6 +184,7 @@ export function useCraftItemNFT() {
               assetId,
               {
                 name: 'game_item',
+                lootTableId: input.lootTableId, // the server checks this against the item's DB doc
                 itemName: input.name,
                 description: input.description,
                 icon: input.icon,

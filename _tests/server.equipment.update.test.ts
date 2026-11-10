@@ -68,6 +68,7 @@ jest.mock('@bsv/sdk', () => ({
 }));
 
 import request from 'supertest';
+import { inscribedScript } from './helpers/ordinalScript';
 import { buildApp } from '@server/app';
 import { ObjectId } from 'mongodb';
 import { Transaction } from '@bsv/sdk';
@@ -110,16 +111,7 @@ const validBody = {
   walletParams: { protocolID: [0, 'x'], keyID: '1', counterparty: 'cp' },
 };
 
-/** Locking script whose chunks carry a bsv-20 transfer inscription, as OrdinalsP2PKH lays them out. */
-const bytes = (text: string) => [...Buffer.from(text, 'utf8')];
-const inscribed = (hex: string, amt: number) => ({
-  toHex: () => hex,
-  chunks: [
-    { op: 0 }, { op: 0x63 }, { op: 3, data: bytes('ord') }, { op: 0x51 },
-    { op: 18, data: bytes('application/bsv-20') }, { op: 0 },
-    { op: 1, data: bytes(JSON.stringify({ p: 'bsv-20', op: 'transfer', amt, id: 'ANY_0' })) },
-  ],
-});
+const inscribed = (hex: string, amt: number, lootTableId: string) => inscribedScript(hex, amt, { lootTableId });
 const defaultInputs = [
   { sourceTXID: 'ORIGTX', sourceOutputIndex: 0 },
   { sourceTXID: 'SCROLLPTX', sourceOutputIndex: 0 },
@@ -127,13 +119,18 @@ const defaultInputs = [
 ];
 
 /** payment tx + batch-transfer tx — reached by every request past the DB checks. */
-function seedPaymentAndBatchMocks(scripts = ['LOCK_PS_0', 'LOCK_PS_1', 'LOCK_PS_2'], inputs = defaultInputs, amts = [1, 1, 1]) {
+function seedPaymentAndBatchMocks(
+  scripts = ['LOCK_PS_0', 'LOCK_PS_1', 'LOCK_PS_2'],
+  inputs = defaultInputs,
+  amts = [1, 1, 1],
+  lootIds = ['common_dagger', 'prefix_damage_common', 'suffix_damage_common'],
+) {
   (Transaction.fromBEEF as jest.Mock)
     .mockReturnValueOnce({ id: () => 'PAYTXID', outputs: [{ satoshis: 100 }], toBEEF: () => [3, 3] })
     .mockReturnValueOnce({
       id: () => 'BATCHTX',
       inputs,
-      outputs: scripts.map((hex, i) => ({ lockingScript: inscribed(hex, amts[i]) })),
+      outputs: scripts.map((hex, i) => ({ lockingScript: inscribed(hex, amts[i], lootIds[i]) })),
       toBEEF: () => [1, 1],
     });
 }
@@ -306,6 +303,14 @@ describe('POST /api/equipment/update', () => {
     const res = await post(validBody);
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Scroll suffix_damage_common transfer must carry amount 1' });
+    expectNotClaimed();
+  });
+
+  it('400 when a scroll transfer is inscribed as another scroll', async () => {
+    seedPaymentAndBatchMocks(undefined, undefined, undefined, ['common_dagger', 'prefix_damage_common', 'suffix_autoclick_legendary_2']);
+    const res = await post(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Scroll suffix_damage_common transfer is inscribed as suffix_autoclick_legendary_2' });
     expectNotClaimed();
   });
 

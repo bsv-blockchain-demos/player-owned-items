@@ -275,6 +275,7 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
         ownedTokenId: m.ownedTokenId,
         amount: m.quantity,
         amountRule: `must carry the full token quantity (${m.quantity})`,
+        lootTableId: m.lootTableId,
       })),
       ...items.map((t) => ({
         label: `Item ${t.lootTableId}`,
@@ -282,6 +283,7 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
         ownedTokenId: t.ownedTokenId,
         amount: 1,
         amountRule: 'must carry amount 1',
+        lootTableId: t.lootTableId,
       })),
     ],
   );

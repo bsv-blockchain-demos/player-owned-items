@@ -1,10 +1,12 @@
 // Checks a client batch transfer (posted as BEEF) before the server spends its outputs:
 // each named outpoint must be an output of that tx, locked to the server key derived
-// from the client's nonce N2, spending the owned token it stands for, with the amount expected.
+// from the client's nonce N2, spending the owned token it stands for, with the amount expected,
+// and inscribed with the same lootTableId as the owned DB doc.
 import { P2PKH, Hash, type Transaction, type WalletInterface } from '@bsv/sdk';
 import { TOKEN_PROTOCOL } from '@shared/tokenDerivation';
 import { getServerPublicKey } from '@server/lib/serverWallet';
 import { voutOf, transferAmount } from '@server/lib/materialUnits';
+import { inscribedLootTableId } from '@server/lib/tokenScript';
 
 /** Hex every transferred output's locking script must contain: P2PKH of the server key derived from N2. */
 export async function serverLockPattern(
@@ -25,6 +27,7 @@ export interface ExpectedTransfer {
   ownedTokenId: string; // outpoint the batch must spend
   amount: number;
   amountRule: string; // e.g. "must carry amount 1"
+  lootTableId: string; // the owned DB doc's; the output's metadata must name the same
 }
 
 /** The first reason the batch doesn't move each owned token whole to the server, or null. */
@@ -47,6 +50,8 @@ export function checkBatchTransfer(
     if (!spent.has(e.ownedTokenId)) return { status: 400, error: `${e.label} transfer does not spend owned token` };
     // A partial amount would leave the rest of the token untracked on chain.
     if (transferAmount(output.lockingScript) !== e.amount) return { status: 400, error: `${e.label} transfer ${e.amountRule}` };
+    const inscribed = inscribedLootTableId(output.lockingScript);
+    if (inscribed !== e.lootTableId) return { status: 400, error: `${e.label} transfer is inscribed as ${inscribed ?? 'no lootTableId'}` };
   }
   return null;
 }

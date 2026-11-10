@@ -183,6 +183,7 @@ equipmentRouter.post('/update', requireAuthProof('update-equipment'), async (req
       ownedTokenId: doc.tokenId!,
       amount: 1,
       amountRule: 'must carry amount 1',
+      lootTableId: doc.lootTableId,
     })),
   );
   if (transferFailure) {

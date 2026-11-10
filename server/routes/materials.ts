@@ -31,6 +31,7 @@ import {
   voutOf,
   transferAmount,
 } from '@server/lib/materialUnits';
+import { inscribedLootTableId } from '@server/lib/tokenScript';
 
 const CLAIM_FAILED = 'Inventory items missing or already being minted';
 
@@ -472,6 +473,12 @@ materialsRouter.post('/add-and-merge', requireAuthProof('merge-material'), async
   // A partial amount would leave the rest of the token untracked on chain.
   if (transferAmount(transferOutput.lockingScript) !== existingToken.quantity) {
     res.status(400).json({ error: `Transfer must carry the full token quantity (${existingToken.quantity})` });
+    return;
+  }
+
+  const inscribed = inscribedLootTableId(transferOutput.lockingScript);
+  if (inscribed !== existingToken.lootTableId) {
+    res.status(400).json({ error: `Transfer is inscribed as ${inscribed ?? 'no lootTableId'}` });
     return;
   }
 

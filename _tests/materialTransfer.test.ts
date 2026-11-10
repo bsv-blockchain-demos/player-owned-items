@@ -3,6 +3,7 @@
 import { PrivateKey, LockingScript } from '@bsv/sdk';
 import { OrdinalsP2PKH } from '@shared/ordinalP2PKH';
 import { transferAmount, voutOf } from '@server/lib/materialUnits';
+import { tokenMetadata } from '@server/lib/tokenScript';
 
 const pubKey = PrivateKey.fromRandom().toPublicKey().toString();
 const metadata = { name: 'material_token', lootTableId: 'common_wood', tier: 1 };
@@ -37,5 +38,32 @@ describe('voutOf', () => {
     ['TX', null],
   ])('%s -> %s', (outpoint, expected) => {
     expect(voutOf(outpoint, 'TX')).toBe(expected);
+  });
+});
+
+describe('tokenMetadata', () => {
+  it('reads the OP_RETURN metadata of a transfer', () => {
+    const script = new OrdinalsP2PKH().lock(pubKey, 'TX_0', metadata, 'transfer', 7);
+    expect(tokenMetadata(parsed(script))).toEqual({ app: 'monsterbattle', type: 'ord', ...metadata });
+  });
+
+  it('reads metadata long enough to need OP_PUSHDATA2', () => {
+    const long = { ...metadata, description: 'x'.repeat(300) }; // 414 bytes: length bytes 0x9e 0x01 (asymmetric, so byte order matters)
+    const script = new OrdinalsP2PKH().lock(pubKey, 'TX_0', long, 'transfer', 1);
+    expect(tokenMetadata(parsed(script))).toEqual(expect.objectContaining({ lootTableId: 'common_wood', description: long.description }));
+  });
+
+  it('returns null for a script without trailing metadata', () => {
+    expect(tokenMetadata(LockingScript.fromASM('OP_DUP OP_HASH160 ' + '00'.repeat(20) + ' OP_EQUALVERIFY OP_CHECKSIG'))).toBeNull();
+  });
+
+  it.each([
+    ['non-JSON', 'not json'],
+    ['a JSON array', '[1,2]'],
+  ])('returns null when the OP_RETURN data is %s', (_label, text) => {
+    const data = Buffer.from(text, 'utf8');
+    // OP_RETURN + one push, the shape the SDK parses into a single raw-remainder chunk
+    const hex = '6a' + data.length.toString(16).padStart(2, '0') + data.toString('hex');
+    expect(tokenMetadata(LockingScript.fromHex(hex))).toBeNull();
   });
 });
