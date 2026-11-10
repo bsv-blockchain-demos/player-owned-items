@@ -76,6 +76,17 @@ describe('claimMaterialUnits (real mongod)', () => {
     expect(await units.countDocuments({ mintClaim: { $exists: true } })).toBe(0);
   });
 
+  // CodeQL js/sql-injection: a body value that reached the filter as an object would act as an operator.
+  it.each([
+    ['lootTableId', { $ne: null }, 1],
+    ['tier', 'common_wood', { $gt: 0 }],
+  ])('treats an operator object passed as %s as a literal (claims nothing)', async (_field, lootTableId, tier) => {
+    const ids = [await lootDrop(), await lootDrop()];
+
+    expect(await claimMaterialUnits(units, 'u1', lootTableId as any, tier as any, ids)).toBeNull();
+    expect(await units.countDocuments({ mintClaim: { $exists: true } })).toBe(0);
+  });
+
   it('lets only one of two overlapping concurrent claims win', async () => {
     const ids = [await lootDrop(), await lootDrop(), await lootDrop()];
 

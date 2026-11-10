@@ -31,8 +31,9 @@ export async function claimMaterialUnits(
     {
       _id: { $in: ids },
       userId,
-      lootTableId,
-      tier,
+      // $eq: a value from a request body is matched literally, never read as an operator.
+      lootTableId: { $eq: lootTableId },
+      tier: { $eq: tier },
       // Unminted = missing OR null; select-loot's `nftLootId: undefined` is stored as null.
       nftLootId: { $not: { $type: 'objectId' } },
       tokenId: { $not: { $type: 'string' } },

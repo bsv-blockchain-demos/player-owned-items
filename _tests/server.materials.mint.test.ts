@@ -253,8 +253,8 @@ describe('POST /api/materials/mint-and-transfer', () => {
       {
         _id: { $in: [new ObjectId(ID_A), new ObjectId(ID_B)] },
         userId: 'u1',
-        lootTableId: 'phoenix_feather',
-        tier: 1,
+        lootTableId: { $eq: 'phoenix_feather' },
+        tier: { $eq: 1 },
         nftLootId: { $not: { $type: 'objectId' } }, // unminted = missing OR null (select-loot stores null)
         tokenId: { $not: { $type: 'string' } },
         mintClaim: { $exists: false },
