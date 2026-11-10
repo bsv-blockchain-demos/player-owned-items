@@ -29,6 +29,7 @@ import {
   anyTokenListed,
   TOKEN_LISTED,
   voutOf,
+  mergeableStackFilter,
 } from '@server/lib/materialUnits';
 import { transferAmount, inscribedLootTableId, inscribedAssetId, mintAssetId } from '@server/lib/tokenScript';
 import { inputOutpoint, strayAssetOutput } from '@server/lib/batchTransfer';
@@ -100,7 +101,7 @@ materialsRouter.post('/mint-and-transfer', requireAuthProof('mint-material'), as
   };
 
   // Connect to MongoDB
-  const { materialTokensCollection, userInventoryCollection } = await connectToMongo();
+  const { materialTokensCollection, userInventoryCollection, marketplaceItemsCollection } = await connectToMongo();
 
   // Decode payment BEEF (no wallet needed)
   const paymentBeef = decodeBeef(paymentTx);
@@ -114,13 +115,10 @@ materialsRouter.post('/mint-and-transfer', requireAuthProof('mint-material'), as
   const paymentOutpoint = `${paymentTxId}.0`;
   step('validated + payment parsed');
 
-  // Check for an existing token FIRST (before minting)
-  const existingToken = await materialTokensCollection.findOne({
-    userId,
-    lootTableId: material.lootTableId,
-    tier,
-    consumed: { $ne: true },
-  });
+  // Check for a stack to merge into FIRST (before minting)
+  const existingToken = await materialTokensCollection.findOne(
+    await mergeableStackFilter(marketplaceItemsCollection, userId, material.lootTableId, tier),
+  );
 
   if (existingToken) {
     res.status(409).json(
@@ -781,15 +779,20 @@ materialsRouter.post('/check-token', requireSession, async (req: Request, res: R
       res.status(400).json({ error: 'Missing lootTableId or tier' });
       return;
     }
+    if (getLootItemById(lootTableId)?.type !== 'material') {
+      res.status(400).json({ error: `Not a material: ${lootTableId}` });
+      return;
+    }
+    if (!isValidTier(tier)) {
+      res.status(400).json({ error: 'Invalid tier' });
+      return;
+    }
 
-    const { materialTokensCollection } = await connectToMongo();
+    const { materialTokensCollection, marketplaceItemsCollection } = await connectToMongo();
 
-    const existingToken = await materialTokensCollection.findOne({
-      userId,
-      lootTableId,
-      tier,
-      consumed: { $ne: true },
-    });
+    const existingToken = await materialTokensCollection.findOne(
+      await mergeableStackFilter(marketplaceItemsCollection, userId, lootTableId, tier),
+    );
 
     if (existingToken) {
       res.json({

@@ -15,6 +15,9 @@ jest.mock('@server/lib/authNonceStore', () => ({ consumeNonce: jest.fn() }));
 const materialTokensFindOne = jest.fn();
 const materialTokensUpdateOne = jest.fn(async () => ({ modifiedCount: 1 }));
 const materialTokensDeleteOne = jest.fn(async () => ({ deletedCount: 1 }));
+// The user's live material listings (their stacks sit in an OrdLock and can't be merged into).
+const liveListings = jest.fn(async (): Promise<unknown[]> => [{ materialTokenId: '64b0000000000000000000aa' }]);
+const listingsFind = jest.fn((_filter: any) => ({ toArray: liveListings }));
 
 jest.mock('@server/lib/mongodb', () => ({
   connectToMongo: jest.fn(async () => ({
@@ -23,10 +26,12 @@ jest.mock('@server/lib/mongodb', () => ({
       updateOne: materialTokensUpdateOne,
       deleteOne: materialTokensDeleteOne,
     },
+    marketplaceItemsCollection: { find: listingsFind },
   })),
 }));
 
 import express from 'express';
+import { ObjectId } from 'mongodb';
 import cookieParser from 'cookie-parser';
 import request from 'supertest';
 import { materialsRouter } from '@server/routes/materials';
@@ -59,7 +64,7 @@ describe('POST /api/materials/check-token', () => {
   it('401s with no verified cookie', async () => {
     const res = await request(appWithMaterialsRouter())
       .post('/api/materials/check-token')
-      .send({ lootTableId: 'iron_ore', tier: 1 });
+      .send({ lootTableId: 'common_wood', tier: 1 });
 
     expect(res.status).toBe(401);
     expect(res.body).toEqual({ error: 'Unauthorized' });
@@ -77,7 +82,7 @@ describe('POST /api/materials/check-token', () => {
     const res = await request(appWithMaterialsRouter())
       .post('/api/materials/check-token')
       .set('Cookie', await authCookie())
-      .send({ lootTableId: 'iron_ore', tier: 1 });
+      .send({ lootTableId: 'common_wood', tier: 1 });
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
@@ -90,12 +95,33 @@ describe('POST /api/materials/check-token', () => {
         counterparty: 'SERVER_ID',
       },
     });
+    // Only a stack a merge can spend: not listed, mid-purchase or claimed.
+    expect(listingsFind).toHaveBeenCalledWith({ sellerId: 'user-123', materialTokenId: { $exists: true }, status: { $in: ['active', 'pending'] } });
     expect(materialTokensFindOne).toHaveBeenCalledWith({
       userId: 'user-123',
-      lootTableId: 'iron_ore',
-      tier: 1,
+      lootTableId: { $eq: 'common_wood' },
+      tier: { $eq: 1 },
       consumed: { $ne: true },
+      pendingClaim: { $exists: false },
+      _id: { $nin: [new ObjectId('64b0000000000000000000aa')] },
     });
+  });
+
+  // The body values reach a Mongo filter; an object would act as an operator.
+  it.each([
+    ['an operator object as lootTableId', { lootTableId: { $ne: null }, tier: 1 }, 'Not a material: [object Object]'],
+    ['a non-material lootTableId', { lootTableId: 'common_dagger', tier: 1 }, 'Not a material: common_dagger'],
+    ['an operator object as tier', { lootTableId: 'common_wood', tier: { $gt: 0 } }, 'Invalid tier'],
+    ['an out-of-range tier', { lootTableId: 'common_wood', tier: 6 }, 'Invalid tier'],
+  ])('400s on %s', async (_label, body, error) => {
+    const res = await request(appWithMaterialsRouter())
+      .post('/api/materials/check-token')
+      .set('Cookie', await authCookie())
+      .send(body);
+
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error });
+    expect(materialTokensFindOne).not.toHaveBeenCalled();
   });
 
   it('200s with exists:false when no token is found', async () => {
@@ -104,7 +130,7 @@ describe('POST /api/materials/check-token', () => {
     const res = await request(appWithMaterialsRouter())
       .post('/api/materials/check-token')
       .set('Cookie', await authCookie())
-      .send({ lootTableId: 'iron_ore', tier: 1 });
+      .send({ lootTableId: 'common_wood', tier: 1 });
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ exists: false });
@@ -114,7 +140,7 @@ describe('POST /api/materials/check-token', () => {
     const res = await request(appWithMaterialsRouter())
       .post('/api/materials/check-token')
       .set('Cookie', await authCookie())
-      .send({ lootTableId: 'iron_ore' });
+      .send({ lootTableId: 'common_wood' });
 
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Missing lootTableId or tier' });
