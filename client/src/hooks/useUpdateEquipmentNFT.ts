@@ -254,42 +254,18 @@ export function useUpdateEquipmentNFT() {
       // SERVER: Update equipment
       // ===================================================
 
-      let updatedPrefix = equipmentItem.prefix || null;
-      let updatedSuffix = equipmentItem.suffix || null;
-      for (const scroll of inscriptionScrolls) {
-        if (scroll.inscriptionData.slot === 'prefix') {
-          updatedPrefix = { type: scroll.inscriptionData.inscriptionType, value: scroll.inscriptionData.statValue, name: scroll.inscriptionData.name };
-        } else {
-          updatedSuffix = { type: scroll.inscriptionData.inscriptionType, value: scroll.inscriptionData.statValue, name: scroll.inscriptionData.name };
-        }
-      }
-
+      // The server derives the item, stats and inscriptions from the owned docs + loot table.
       const apiResult = await apiFetchStepUp('/api/equipment/update', {
         wallet,
         context: 'update-equipment',
         body: {
           originalEquipmentInventoryId: equipmentItem.inventoryItemId,
-          originalEquipmentTokenId: equipmentItem.tokenId,
           inscriptionScrollInventoryIds: inscriptionScrolls.map(s => s.inventoryItemId),
           transferredEquipmentTokenId,
           transferredScrollTokenIds,
           batchTransferBeef: encodeBeef(Array.from(transferAction.tx!)),
           transferNonce,
           userIdentityKey,
-          equipmentData: {
-            lootTableId: equipmentItem.lootTableId,
-            name: equipmentItem.name,
-            description: equipmentItem.description,
-            icon: equipmentItem.icon,
-            rarity: equipmentItem.rarity,
-            type: equipmentItem.type,
-            tier: equipmentItem.tier,
-            equipmentStats: equipmentItem.equipmentStats,
-            crafted: equipmentItem.crafted || null,
-            borderGradient: equipmentItem.borderGradient,
-          },
-          updatedPrefix,
-          updatedSuffix,
           paymentTx: encodeBeef(paymentTx),
           walletParams,
         },

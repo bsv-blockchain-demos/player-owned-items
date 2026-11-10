@@ -11,12 +11,13 @@
 import { Router, type Request, type Response } from 'express';
 import { ObjectId, type WithId } from 'mongodb';
 import { EQUIPMENT_SLOTS, type MaterialToken, type UserInventory } from '@shared/types';
-import { Transaction, P2PKH, Beef, Hash } from '@bsv/sdk';
+import { Transaction, Beef } from '@bsv/sdk';
 import { WalletP2PKH } from '@bsv/wallet-helper';
 import { requireAuthProof } from '@server/middleware/requireAuthProof';
 import { getWalletQueue } from '@server/lib/walletQueue';
 import { connectToMongo, getClient } from '@server/lib/mongodb';
-import { getServerWallet, getServerPublicKey, getServerIdentityPublicKey } from '@server/lib/serverWallet';
+import { getServerWallet, getServerIdentityPublicKey } from '@server/lib/serverWallet';
+import { serverLockPattern, checkBatchTransfer } from '@server/lib/batchTransfer';
 import { OrdinalsP2PKH } from '@shared/ordinalP2PKH';
 import { broadcastTX } from '@shared/overlayFunctions';
 import { decodeBeef, encodeBeef } from '@shared/beefEncoding';
@@ -31,8 +32,6 @@ import {
   anyTokenListed,
   TOKEN_LISTED,
   ITEM_LISTED,
-  voutOf,
-  transferAmount,
 } from '@server/lib/materialUnits';
 
 export const craftingRouter = Router();
@@ -265,70 +264,30 @@ craftingRouter.post('/mint-and-transfer', requireAuthProof('craft'), async (req:
   // Parse batch transfer BEEF once — all material outputs live in this tx
   const batchTransferTransaction = Transaction.fromBEEF(decodeBeef(batchTransferBeef));
 
-  // Derive the server key all materials were locked to (shared N2)
-  const expectedServerKey = transferNonce
-    ? (await serverWallet.getPublicKey({
-        protocolID: TOKEN_PROTOCOL,
-        keyID: transferNonce,
-        counterparty: userIdentityKey,
-        forSelf: true,
-      })).publicKey
-    : await getServerPublicKey(); // legacy fallback
-  // OrdinalsP2PKH embeds hash160(pubkey), not raw pubkey hex
-  const expectedScriptPattern = new P2PKH().lock(Hash.hash160(expectedServerKey, 'hex')).toHex();
-
-  const spentOutpoints = new Set(
-    batchTransferTransaction.inputs.map(
-      (i) => `${i.sourceTXID || i.sourceTransaction?.id('hex')}.${i.sourceOutputIndex}`,
-    ),
-  );
-
   // Validate each transferred output: materials, then items
-  const batchTxId = batchTransferTransaction.id('hex');
-  const transferredOutputs = [
-    ...materials.map((m) => ({
-      label: `Material ${m.lootTableId}`,
-      tokenId: m.tokenId,
-      ownedTokenId: m.ownedTokenId,
-      amount: m.quantity,
-      amountRule: `must carry the full token quantity (${m.quantity})`,
-    })),
-    ...items.map((t) => ({
-      label: `Item ${t.lootTableId}`,
-      tokenId: t.tokenId,
-      ownedTokenId: t.ownedTokenId,
-      amount: 1,
-      amountRule: 'must carry amount 1',
-    })),
-  ];
-  for (const output of transferredOutputs) {
-    const vout = voutOf(output.tokenId, batchTxId);
-    if (vout === null) {
-      res.status(400).json({ error: `Transfer outpoint not in batch transfer: ${output.tokenId}` });
-      return;
-    }
-    const transferOutput = batchTransferTransaction.outputs[vout];
-
-    if (!transferOutput) {
-      res.status(404).json({ error: `Transfer output not found: ${output.tokenId}` });
-      return;
-    }
-
-    if (!transferOutput.lockingScript.toHex().includes(expectedScriptPattern)) {
-      res.status(400).json({ error: `${output.label} not locked to server derived key` });
-      return;
-    }
-
-    if (!spentOutpoints.has(output.ownedTokenId)) {
-      res.status(400).json({ error: `${output.label} transfer does not spend owned token` });
-      return;
-    }
-
-    // A partial amount would leave the rest of the token untracked on chain.
-    if (transferAmount(transferOutput.lockingScript) !== output.amount) {
-      res.status(400).json({ error: `${output.label} transfer ${output.amountRule}` });
-      return;
-    }
+  const transferFailure = checkBatchTransfer(
+    batchTransferTransaction,
+    await serverLockPattern(serverWallet, transferNonce, userIdentityKey),
+    [
+      ...materials.map((m) => ({
+        label: `Material ${m.lootTableId}`,
+        tokenId: m.tokenId,
+        ownedTokenId: m.ownedTokenId,
+        amount: m.quantity,
+        amountRule: `must carry the full token quantity (${m.quantity})`,
+      })),
+      ...items.map((t) => ({
+        label: `Item ${t.lootTableId}`,
+        tokenId: t.tokenId,
+        ownedTokenId: t.ownedTokenId,
+        amount: 1,
+        amountRule: 'must carry amount 1',
+      })),
+    ],
+  );
+  if (transferFailure) {
+    res.status(transferFailure.status).json({ error: transferFailure.error });
+    return;
   }
 
   const materialChanges = materials.filter((m) => m.changeAmount > 0);
