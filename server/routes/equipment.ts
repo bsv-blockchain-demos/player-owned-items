@@ -24,6 +24,7 @@ import { TOKEN_PROTOCOL, generateNonce, deriveRecipientKey } from '@shared/token
 import { getLootItemById } from '@shared/loot-table';
 import { EQUIPMENT_SLOTS, type Inscription, type InscriptionData, type UserInventory } from '@shared/types';
 import { serverLockPattern, checkBatchTransfer } from '@server/lib/batchTransfer';
+import { EXCLUSIVE_INSCRIPTION_TYPES } from '@shared/inscriptions';
 import {
   parseInventoryIds,
   claimTokens,
@@ -36,8 +37,6 @@ import {
 export const equipmentRouter = Router();
 
 const INSCRIBABLE_TYPES = ['weapon', 'armor', 'artifact'];
-// A prefix and suffix of the same one of these types may not stack (same rule as /api/inscriptions/apply).
-const EXCLUSIVE_INSCRIPTION_TYPES = ['autoclick', 'lifesteal'];
 
 equipmentRouter.post('/update', requireAuthProof('update-equipment'), async (req: Request, res: Response) => {
   const userId = req.userId as string;

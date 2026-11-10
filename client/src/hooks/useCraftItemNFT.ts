@@ -227,7 +227,8 @@ export function useCraftItemNFT() {
       const transferAction = await wallet.signAction({ reference, spends });
       if (!transferAction.tx) throw new Error('Failed to sign batch transfer action');
 
-      // Derive token IDs from the AtomicBEEF (no broadcast — server gets the full BEEF)
+      // Derive token IDs from the AtomicBEEF. signAction has already broadcast the batch,
+      // so a server rejection from here on strands the inputs at the server key.
       const transferTx = Transaction.fromAtomicBEEF(transferAction.tx);
       const transferTxId = transferTx.id('hex');
 

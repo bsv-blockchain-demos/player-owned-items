@@ -6,6 +6,7 @@ import toast from 'react-hot-toast';
 import { tierToRoman } from '@/shared/tierUtils';
 import { getInscribedItemName, getInscriptionStatLabel, formatInscriptionStat, getInscriptionRarityColor } from '@/shared/itemNameHelpers';
 import type { Inscription } from '@shared/types';
+import { inscriptionConflict } from '@shared/inscriptions';
 import { useUpdateEquipmentNFT } from '@/hooks/useUpdateEquipmentNFT';
 import { useAuthContext } from '@/contexts/WalletContext';
 import { useEquipment } from '@/contexts/EquipmentContext';
@@ -55,8 +56,8 @@ export default function BlacksmithPage() {
   const fetchInventory = async () => {
     try {
       setLoading(true);
-      // Only fetch minted items (backend filtering)
-      const response = await apiFetch('/api/inventory/get?mintedOnly=true');
+      // Only fetch minted items (backend filtering); a listed item can't be inscribed
+      const response = await apiFetch('/api/inventory/get?mintedOnly=true&excludeListed=true');
       const data = await response.json();
 
       if (response.ok && data.success) {
@@ -100,6 +101,13 @@ export default function BlacksmithPage() {
     }
   };
 
+  // A selected scroll that conflicts with the newly selected equipment is dropped, so it can't reach the server.
+  const selectEquipment = (item: InventoryItem) => {
+    setSelectedEquipment(item);
+    const scrollData = selectedScroll && getLootItemById(selectedScroll.lootTableId)?.inscriptionData;
+    if (scrollData && inscriptionConflict(item, scrollData)) setSelectedScroll(null);
+  };
+
   const handleApplyInscription = async (overwrite = false) => {
     if (!selectedEquipment || !selectedScroll) {
       toast.error('Please select both equipment and scroll');
@@ -126,6 +134,12 @@ export default function BlacksmithPage() {
         const scrollData = getLootItemById(selectedScroll.lootTableId);
         if (!scrollData || !scrollData.inscriptionData) {
           throw new Error('Invalid scroll data');
+        }
+
+        // The server rejects this too, but only after the transfer below is broadcast.
+        const conflict = inscriptionConflict(selectedEquipment, scrollData.inscriptionData);
+        if (conflict) {
+          throw new Error(`Cannot have both ${conflict} prefix and suffix on the same item`);
         }
 
         const inscriptionType = scrollData.inscriptionData.slot;
@@ -347,7 +361,7 @@ export default function BlacksmithPage() {
                 return (
                   <button
                     key={item._id}
-                    onClick={() => setSelectedEquipment(item)}
+                    onClick={() => selectEquipment(item)}
                     className={`w-full text-left p-3 rounded-lg border-2 transition-all cursor-pointer relative ${
                       isSelected
                         ? 'border-orange-500 bg-orange-900/30 shadow-lg z-10'
@@ -411,17 +425,9 @@ export default function BlacksmithPage() {
                 const rarityClasses = getRarityColor(lootItem.rarity);
                 const inscriptionData = lootItem.inscriptionData;
 
-                // Check if this scroll is blocked due to exclusive inscription conflicts
-                // Both autoclick and lifesteal cannot have prefix + suffix on same item
-                const exclusiveTypes = ['autoclick', 'lifesteal'];
-                const isExclusiveType = exclusiveTypes.includes(inscriptionData.inscriptionType);
-                const oppositeSlot = inscriptionData.slot === 'prefix' ? 'suffix' : 'prefix';
-                const hasConflict = selectedEquipment &&
-                  isExclusiveType &&
-                  selectedEquipment[oppositeSlot]?.type === inscriptionData.inscriptionType;
-
-                const isBlocked = !!hasConflict;
-                const conflictType = hasConflict ? inscriptionData.inscriptionType : null;
+                // Blocked if it would put the same autoclick/lifesteal type on both slots
+                const conflictType = selectedEquipment ? inscriptionConflict(selectedEquipment, inscriptionData) : null;
+                const isBlocked = !!conflictType;
 
                 return (
                   <button
@@ -452,7 +458,7 @@ export default function BlacksmithPage() {
                         {isBlocked && conflictType && (
                           <div className="text-xs text-red-400 mt-2 flex items-center gap-1">
                             <span>🚫</span>
-                            <span>Conflicts with {oppositeSlot} {conflictType}</span>
+                            <span>Conflicts with {inscriptionData.slot === 'prefix' ? 'suffix' : 'prefix'} {conflictType}</span>
                           </div>
                         )}
                       </div>

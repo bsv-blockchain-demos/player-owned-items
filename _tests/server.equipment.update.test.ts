@@ -88,7 +88,7 @@ const defaultDocs = (): Record<string, any> => ({
   [EQUIP]: {
     userId: 'u1', lootTableId: 'common_dagger', itemType: 'weapon', tier: 2, nftLootId: new ObjectId(),
     tokenId: 'ORIGTX.0', mintOutpoint: 'ORIGMINT.0', borderGradient: gradient, crafted: true, statRoll: 1.1,
-    rolledStats: { damageBonus: 1 },
+    rolledStats: { damageBonus: 1 }, isEmpowered: true,
   },
   [SCROLL_P]: { userId: 'u1', lootTableId: 'prefix_damage_common', itemType: 'inscription_scroll', tier: 1, nftLootId: new ObjectId(), tokenId: 'SCROLLPTX.0' },
   [SCROLL_S]: { userId: 'u1', lootTableId: 'suffix_damage_common', itemType: 'inscription_scroll', tier: 1, nftLootId: new ObjectId(), tokenId: 'SCROLLSTX.0' },
@@ -264,12 +264,15 @@ describe('POST /api/equipment/update', () => {
     expectNotClaimed();
   });
 
-  it('400 when the result would carry an autoclick prefix and suffix', async () => {
-    ownedDocs[EQUIP].prefix = { type: 'autoclick', value: 1, name: 'Relentless' };
-    ownedDocs[SCROLL_S].lootTableId = 'suffix_autoclick_legendary_2';
+  it.each([
+    ['autoclick', 'suffix_autoclick_legendary_2'],
+    ['lifesteal', 'suffix_lifesteal_legendary'],
+  ])('400 when the result would carry a %s prefix and suffix', async (type, suffixScroll) => {
+    ownedDocs[EQUIP].prefix = { type, value: 1, name: 'Existing' };
+    ownedDocs[SCROLL_S].lootTableId = suffixScroll;
     const res = await post({ ...validBody, inscriptionScrollInventoryIds: [SCROLL_S], transferredScrollTokenIds: ['BATCHTX.1'] });
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({ error: 'Cannot have both autoclick prefix and suffix on the same item' });
+    expect(res.body).toEqual({ error: `Cannot have both ${type} prefix and suffix on the same item` });
     expectNotClaimed();
   });
 
@@ -398,6 +401,7 @@ describe('POST /api/equipment/update', () => {
       crafted: true,
       statRoll: 1.1,
       rolledStats: { damageBonus: 1 },
+      isEmpowered: true,
       borderGradient: gradient,
     }));
     // Consumed docs are deleted only at the outpoints this request claimed.

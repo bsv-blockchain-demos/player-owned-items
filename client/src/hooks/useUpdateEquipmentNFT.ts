@@ -244,7 +244,8 @@ export function useUpdateEquipmentNFT() {
       const transferAction = await wallet.signAction({ reference, spends });
       if (!transferAction.tx) throw new Error('Failed to sign batch transfer action');
 
-      // Derive transferred token IDs from the AtomicBEEF (no broadcast needed — server gets the BEEF)
+      // Derive transferred token IDs from the AtomicBEEF. signAction has already broadcast the batch,
+      // so a server rejection from here on strands the items at the server key.
       const transferTx = Transaction.fromAtomicBEEF(transferAction.tx);
       const transferTxId = transferTx.id('hex');
       const transferredEquipmentTokenId = `${transferTxId}.0`;
