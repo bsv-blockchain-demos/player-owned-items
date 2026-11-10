@@ -99,6 +99,8 @@ export interface Inscription {
 }
 
 // User Inventory document
+export const EQUIPMENT_SLOTS: readonly EquipmentSlot[] = ['weapon', 'armor', 'accessory1', 'accessory2'];
+
 export interface UserInventory {
   _id?: ObjectId;
   userId: string;          // Reference to User.userId
@@ -127,6 +129,8 @@ export interface UserInventory {
   mintOutpoint?: string;    // Original server mint proof (outpoint: "txid.vout")
   keyId?: string;           // Nonce used to derive the key locking this token (absent = legacy)
   counterparty?: string;    // Derivation counterparty (server identity key)
+  mintClaim?: string;       // Set while this material unit is being minted into a token
+  pendingClaim?: string;    // Set while a craft is spending this minted item
 
   // Equipment Customization (Phase 1: Inscriptions)
   prefix?: Inscription;     // Prefix inscription (e.g., "Savage" +5 damage)
@@ -157,12 +161,7 @@ export interface PlayerStats {
   currentHealth: number;
 
   // Equipment slots (single object containing all equipment)
-  equippedItems?: {
-    weapon?: ObjectId;
-    armor?: ObjectId;
-    accessory1?: ObjectId;
-    accessory2?: ObjectId;
-  };
+  equippedItems?: Partial<Record<EquipmentSlot, ObjectId>>;
   equippedConsumables?: [ObjectId | 'empty', ObjectId | 'empty', ObjectId | 'empty', ObjectId | 'empty']; // Array of 4 ('empty' for empty slots) - Enables complex loadout strategies
   equippedSpell?: ObjectId | 'empty'; // Phase 2.6: Spell scroll slot (Q key)
   lastSpellCast?: number; // Phase 2.6: Server-side spell cooldown tracking (timestamp in ms)
@@ -441,6 +440,7 @@ export interface MaterialToken {
   counterparty?: string;   // Derivation counterparty (the server identity key that locked to user)
   mintOutpoint?: string;   // Server mint outpoint (txid.vout) - proves server minted token
   transferTransactionId?: string; // DEPRECATED: Use mintOutpoint/tokenId instead (redundant)
+  pendingClaim?: string;   // Set while a craft/merge is spending this token
   consumed?: boolean;      // True if token was burned (quantity reached 0)
   consumedAt?: Date;       // When token was burned
   consumeTransactionId?: string; // Transaction ID of burn (no vout needed - item is consumed)

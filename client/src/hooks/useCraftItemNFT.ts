@@ -7,12 +7,13 @@ import { encodeBeef, decodeBeef } from '@shared/beefEncoding';
 import { internalizeToBasket } from '@/shared/internalizeToBasket';
 import { TOKEN_PROTOCOL, generateNonce, deriveRecipientKey } from '@shared/tokenDerivation';
 import { fetchTokenSourceTx } from '@/shared/fetchTokenSourceTx';
+import type { LootItem } from '@shared/loot-table';
 import { apiFetchStepUp } from '@/lib/apiFetchStepUp';
 
 /**
  * Hook for crafting items on the BSV blockchain (derived-key pattern).
  *
- * Client batches ALL materials into ONE transfer tx (each input unlocked with its own
+ * Client batches ALL materials and artifact NFTs into ONE transfer tx (each input unlocked with its own
  * stored derivation). All transfer outputs lock to a shared server-derived key (single
  * nonce N2). Server mints crafted item, then returns crafted item + change tokens as
  * BEEF for wallet internalization.
@@ -22,11 +23,12 @@ export interface CraftingInputItem {
   inventoryItemId: string;
   nftLootId?: string;
   tokenId?: string;
+  mintOutpoint?: string; // BSV-21 id of the token, carried by every transfer
   transactionId?: string;
   name: string;
   rarity: string;
   type: string;
-  itemType: 'weapon' | 'armor' | 'consumable' | 'material' | 'artifact';
+  itemType: LootItem['type'];
   lootTableId?: string;
   currentQuantity?: number;
   quantityNeeded: number;
@@ -41,28 +43,13 @@ export interface CraftItemNFTParams {
   wallet: WalletClient;
   recipeId: string;
   inputItems: CraftingInputItem[];
-  outputItem: {
-    inventoryItemId: string;
-    lootTableId: string;
-    name: string;
-    description: string;
-    icon: string;
-    rarity: 'common' | 'rare' | 'epic' | 'legendary';
-    type: 'weapon' | 'armor' | 'consumable' | 'material' | 'artifact';
-    tier?: number;
-    equipmentStats?: Record<string, number>;
-    crafted?: {
-      statRoll: number;
-      craftedBy: string;
-    };
-    borderGradient: {
-      color1: string;
-      color2: string;
-    };
-  };
+  // Display only — the server derives the crafted item from the recipe.
+  outputItem: { name: string };
 }
 
 export interface CraftItemNFTResult {
+  statRoll?: number;
+  rolledStats?: Record<string, number>;
   nftId?: string;
   tokenId?: string;
   transactionId?: string;
@@ -77,6 +64,32 @@ export interface CraftItemNFTResult {
   }>;
   success: boolean;
   error?: string;
+}
+
+const isMaterialInput = (input: CraftingInputItem) => input.itemType === 'material';
+
+/** Inputs in batch-transfer order: material tokens, then item NFTs. Inputs without a token are dropped. */
+export function craftBatch(inputItems: CraftingInputItem[]): CraftingInputItem[] {
+  const tokens = inputItems.filter((input) => input.tokenId);
+  return [...tokens.filter(isMaterialInput), ...tokens.filter((input) => !isMaterialInput(input))];
+}
+
+/** What the server is told: each batch output by outpoint, plus the DB doc it carries. */
+export function craftTransfers(batch: CraftingInputItem[], transferTxId: string) {
+  const outpoint = (input: CraftingInputItem) => `${transferTxId}.${batch.indexOf(input)}`;
+  return {
+    // nftLootId carries a material token's MaterialToken _id.
+    transferredMaterials: batch.filter(isMaterialInput).map((input) => ({
+      lootTableId: input.lootTableId!,
+      tokenId: outpoint(input),
+      materialTokenId: input.nftLootId!,
+    })),
+    transferredItems: batch.filter((input) => !isMaterialInput(input)).map((input) => ({
+      lootTableId: input.lootTableId!,
+      tokenId: outpoint(input),
+      inventoryItemId: input.inventoryItemId,
+    })),
+  };
 }
 
 export function useCraftItemNFT() {
@@ -113,11 +126,14 @@ export function useCraftItemNFT() {
       );
 
       // ===================================================
-      // CLIENT: Batch transfer all materials to server
+      // CLIENT: Batch transfer all materials and items to server
       // ===================================================
 
       const ordinalP2PKH = new OrdinalsP2PKH();
-      const materialInputs = inputItems.filter(input => input.tokenId && input.itemType === 'material');
+      const batchInputs = craftBatch(inputItems);
+      // The server rejects a transfer without the token's mint id, and only after this batch broadcasts.
+      const unminted = batchInputs.find((input) => !input.mintOutpoint);
+      if (unminted) throw new Error(`${unminted.name} has no recorded mint and cannot be transferred`);
 
       // Per-input unlock: each token has its own stored derivation (legacy fallback when absent)
       const buildUnlock = (m: { keyId?: string; counterparty?: string }) =>
@@ -125,11 +141,11 @@ export function useCraftItemNFT() {
           m.keyId ? { protocolID: TOKEN_PROTOCOL, keyID: m.keyId, counterparty: m.counterparty! } : undefined);
 
       // All inputs share the same script length (108 bytes)
-      const unlockingScriptLength = await buildUnlock(materialInputs[0]).estimateLength();
+      const unlockingScriptLength = await buildUnlock(batchInputs[0]).estimateLength();
 
-      // Resolve each material's source tx (overlay → wallet-basket fallback)
+      // Resolve each input's source tx (overlay → wallet-basket fallback)
       const sourceTransactions: Transaction[] = [];
-      for (const input of materialInputs) {
+      for (const input of batchInputs) {
         sourceTransactions.push(await fetchTokenSourceTx(wallet, input.tokenId!));
       }
 
@@ -138,8 +154,8 @@ export function useCraftItemNFT() {
       for (const sourceTx of sourceTransactions) mergedBeef.mergeBeef(sourceTx.toBEEF());
       const inputBEEF = mergedBeef.toBinary();
 
-      const inputs = materialInputs.map((input) => ({
-        inputDescription: `Material token: ${input.name}`,
+      const inputs = batchInputs.map((input) => ({
+        inputDescription: `${isMaterialInput(input) ? 'Material token' : 'Item'}: ${input.name}`,
         outpoint: input.tokenId!,
         unlockingScriptLength,
       }));
@@ -148,31 +164,45 @@ export function useCraftItemNFT() {
       const transferNonce = generateNonce();
       const serverKey = await deriveRecipientKey(wallet, serverIdentityKey, transferNonce);
 
-      const outputs = materialInputs.map((input) => {
-        const assetId = input.tokenId!.replace('.', '_');
-        return {
-          outputDescription: `Transfer ${input.name} to server`,
-          lockingScript: ordinalP2PKH.lock(
-            serverKey,
-            assetId,
-            {
-              name: 'material_token',
-              lootTableId: input.lootTableId,
-              itemName: input.name,
-              description: input.description,
-              icon: input.icon,
-              rarity: input.rarity,
-              tier: input.tier || 1,
-            },
-            'transfer',
-            input.currentQuantity
-          ).toHex(),
-          satoshis: 1,
-        };
+      // Material tokens move their whole quantity; item NFTs are amount 1.
+      const outputs = batchInputs.map((input) => {
+        const assetId = input.mintOutpoint!.replace('.', '_');
+        const lockingScript = isMaterialInput(input)
+          ? ordinalP2PKH.lock(
+              serverKey,
+              assetId,
+              {
+                name: 'material_token',
+                lootTableId: input.lootTableId,
+                itemName: input.name,
+                description: input.description,
+                icon: input.icon,
+                rarity: input.rarity,
+                tier: input.tier || 1,
+              },
+              'transfer',
+              input.currentQuantity
+            )
+          : ordinalP2PKH.lock(
+              serverKey,
+              assetId,
+              {
+                name: 'game_item',
+                lootTableId: input.lootTableId, // the server checks this against the item's DB doc
+                itemName: input.name,
+                description: input.description,
+                icon: input.icon,
+                rarity: input.rarity,
+                itemType: input.itemType,
+                tier: input.tier || 1,
+              },
+              'transfer'
+            );
+        return { outputDescription: `Transfer ${input.name} to server`, lockingScript: lockingScript.toHex(), satoshis: 1 };
       });
 
       const transferActionRes = await wallet.createAction({
-        description: `Transferring ${materialInputs.length} materials to server for crafting`,
+        description: `Transferring ${batchInputs.length} crafting inputs to server`,
         inputBEEF,
         inputs,
         outputs,
@@ -184,39 +214,31 @@ export function useCraftItemNFT() {
       const reference = transferActionRes.signableTransaction.reference;
       const txToSign = Transaction.fromBEEF(transferActionRes.signableTransaction.tx);
 
-      // Per-input unlock template using each material's own derivation
-      for (let i = 0; i < materialInputs.length; i++) {
-        txToSign.inputs[i].unlockingScriptTemplate = buildUnlock(materialInputs[i]);
+      // Per-input unlock template using each input's own derivation
+      for (let i = 0; i < batchInputs.length; i++) {
+        txToSign.inputs[i].unlockingScriptTemplate = buildUnlock(batchInputs[i]);
         txToSign.inputs[i].sourceTransaction = sourceTransactions[i];
       }
 
       await txToSign.sign();
 
       const spends: Record<string, { unlockingScript: string }> = {};
-      for (let i = 0; i < materialInputs.length; i++) {
+      for (let i = 0; i < batchInputs.length; i++) {
         const unlockingScript = txToSign.inputs[i].unlockingScript;
-        if (!unlockingScript) throw new Error(`Missing unlocking script for input ${i} (${materialInputs[i].name})`);
+        if (!unlockingScript) throw new Error(`Missing unlocking script for input ${i} (${batchInputs[i].name})`);
         spends[i.toString()] = { unlockingScript: unlockingScript.toHex() };
       }
 
       const transferAction = await wallet.signAction({ reference, spends });
       if (!transferAction.tx) throw new Error('Failed to sign batch transfer action');
 
-      // Derive token IDs from the AtomicBEEF (no broadcast — server gets the full BEEF)
+      // Derive token IDs from the AtomicBEEF. signAction has already broadcast the batch,
+      // so a server rejection from here on strands the inputs at the server key.
       const transferTx = Transaction.fromAtomicBEEF(transferAction.tx);
       const transferTxId = transferTx.id('hex');
 
-      const transferredMaterials = materialInputs.map((input, index) => ({
-        lootTableId: input.lootTableId!,
-        tokenId: `${transferTxId}.${index}`,
-        quantity: input.currentQuantity!,
-        quantityNeeded: input.quantityNeeded,
-        itemName: input.name,
-        description: input.description!,
-        icon: input.icon!,
-        rarity: input.rarity as 'common' | 'rare' | 'epic' | 'legendary',
-        tier: input.tier || 1,
-      }));
+      // The server reads quantities and metadata from each named DB doc.
+      const { transferredMaterials, transferredItems } = craftTransfers(batchInputs, transferTxId);
 
       // ===================================================
       // SERVER: Craft item + return BEEF for internalization
@@ -228,6 +250,7 @@ export function useCraftItemNFT() {
         body: {
           recipeId,
           transferredMaterials,
+          transferredItems,
           inputItems: inputItems.map(input => ({
             inventoryItemId: input.inventoryItemId,
             tokenId: input.tokenId,
@@ -238,19 +261,6 @@ export function useCraftItemNFT() {
             keyId: input.keyId,
             counterparty: input.counterparty,
           })),
-          outputItem: {
-            inventoryItemId: outputItem.inventoryItemId,
-            lootTableId: outputItem.lootTableId,
-            name: outputItem.name,
-            description: outputItem.description,
-            icon: outputItem.icon,
-            rarity: outputItem.rarity,
-            type: outputItem.type,
-            tier: outputItem.tier || 1,
-            equipmentStats: outputItem.equipmentStats || {},
-            crafted: outputItem.crafted || null,
-            borderGradient: outputItem.borderGradient,
-          },
           userIdentityKey,
           paymentTx: encodeBeef(paymentTx),
           batchTransferBeef: encodeBeef(Array.from(transferAction.tx!)),
@@ -279,8 +289,10 @@ export function useCraftItemNFT() {
         nftId: result.nftId,
         tokenId: result.tokenId,
         transactionId: result.transferTransactionId,
-        consumedTokenIds: transferredMaterials.map(m => m.tokenId),
+        consumedTokenIds: [...transferredMaterials, ...transferredItems].map(m => m.tokenId),
         materialChanges: result.materialChangeTokens || [],
+        statRoll: result.statRoll,
+        rolledStats: result.rolledStats,
         success: true,
       };
 

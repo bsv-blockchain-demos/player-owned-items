@@ -22,6 +22,7 @@ export interface EquipmentNFTItem {
   inventoryItemId: string;
   nftLootId: string;
   tokenId: string;
+  mintOutpoint?: string; // BSV-21 id of the token, carried by every transfer
   transactionId: string;
   lootTableId: string;
   name: string;
@@ -57,6 +58,7 @@ export interface InscriptionScrollItem {
   inventoryItemId: string;
   nftLootId: string;
   tokenId: string;
+  mintOutpoint?: string;
   transactionId: string;
   lootTableId: string;
   name: string;
@@ -133,6 +135,9 @@ export function useUpdateEquipmentNFT() {
 
       const ordinalP2PKH = new OrdinalsP2PKH();
       const allItems = [equipmentItem, ...inscriptionScrolls];
+      // The server rejects a transfer without the token's mint id, and only after this batch broadcasts.
+      const unminted = allItems.find((item) => !item.mintOutpoint);
+      if (unminted) throw new Error(`${unminted.name} has no recorded mint and cannot be transferred`);
 
       // Per-input unlock: each token has its own stored derivation (legacy fallback when absent)
       const buildUnlock = (item: { keyId?: string; counterparty?: string }) =>
@@ -164,12 +169,13 @@ export function useUpdateEquipmentNFT() {
       const serverKey = await deriveRecipientKey(wallet, serverIdentityKey, transferNonce);
 
       // Equipment output (index 0)
-      const equipmentAssetId = equipmentItem.tokenId.replace('.', '_');
+      const equipmentAssetId = equipmentItem.mintOutpoint!.replace('.', '_');
       const equipmentLockingScript = ordinalP2PKH.lock(
         serverKey,
         equipmentAssetId,
         {
           name: 'game_item',
+          lootTableId: equipmentItem.lootTableId, // the server checks this against the item's DB doc
           itemName: equipmentItem.name,
           description: equipmentItem.description,
           icon: equipmentItem.icon,
@@ -192,12 +198,13 @@ export function useUpdateEquipmentNFT() {
 
       // Scroll outputs (indices 1+), all locked to the same serverKey
       for (const scroll of inscriptionScrolls) {
-        const scrollAssetId = scroll.tokenId.replace('.', '_');
+        const scrollAssetId = scroll.mintOutpoint!.replace('.', '_');
         const scrollLockingScript = ordinalP2PKH.lock(
           serverKey,
           scrollAssetId,
           {
             name: 'inscription_scroll',
+            lootTableId: scroll.lootTableId, // the server checks this against the scroll's DB doc
             itemName: scroll.name,
             description: scroll.description,
             icon: scroll.icon,
@@ -244,7 +251,8 @@ export function useUpdateEquipmentNFT() {
       const transferAction = await wallet.signAction({ reference, spends });
       if (!transferAction.tx) throw new Error('Failed to sign batch transfer action');
 
-      // Derive transferred token IDs from the AtomicBEEF (no broadcast needed — server gets the BEEF)
+      // Derive transferred token IDs from the AtomicBEEF. signAction has already broadcast the batch,
+      // so a server rejection from here on strands the items at the server key.
       const transferTx = Transaction.fromAtomicBEEF(transferAction.tx);
       const transferTxId = transferTx.id('hex');
       const transferredEquipmentTokenId = `${transferTxId}.0`;
@@ -254,42 +262,18 @@ export function useUpdateEquipmentNFT() {
       // SERVER: Update equipment
       // ===================================================
 
-      let updatedPrefix = equipmentItem.prefix || null;
-      let updatedSuffix = equipmentItem.suffix || null;
-      for (const scroll of inscriptionScrolls) {
-        if (scroll.inscriptionData.slot === 'prefix') {
-          updatedPrefix = { type: scroll.inscriptionData.inscriptionType, value: scroll.inscriptionData.statValue, name: scroll.inscriptionData.name };
-        } else {
-          updatedSuffix = { type: scroll.inscriptionData.inscriptionType, value: scroll.inscriptionData.statValue, name: scroll.inscriptionData.name };
-        }
-      }
-
+      // The server derives the item, stats and inscriptions from the owned docs + loot table.
       const apiResult = await apiFetchStepUp('/api/equipment/update', {
         wallet,
         context: 'update-equipment',
         body: {
           originalEquipmentInventoryId: equipmentItem.inventoryItemId,
-          originalEquipmentTokenId: equipmentItem.tokenId,
           inscriptionScrollInventoryIds: inscriptionScrolls.map(s => s.inventoryItemId),
           transferredEquipmentTokenId,
           transferredScrollTokenIds,
           batchTransferBeef: encodeBeef(Array.from(transferAction.tx!)),
           transferNonce,
           userIdentityKey,
-          equipmentData: {
-            lootTableId: equipmentItem.lootTableId,
-            name: equipmentItem.name,
-            description: equipmentItem.description,
-            icon: equipmentItem.icon,
-            rarity: equipmentItem.rarity,
-            type: equipmentItem.type,
-            tier: equipmentItem.tier,
-            equipmentStats: equipmentItem.equipmentStats,
-            crafted: equipmentItem.crafted || null,
-            borderGradient: equipmentItem.borderGradient,
-          },
-          updatedPrefix,
-          updatedSuffix,
           paymentTx: encodeBeef(paymentTx),
           walletParams,
         },

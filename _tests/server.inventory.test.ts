@@ -18,12 +18,15 @@ const materialTokensFind = jest.fn(() => ({ toArray: materialTokensToArray }));
 const marketplaceItemsToArray = jest.fn(async () => [] as any[]);
 const marketplaceItemsFind = jest.fn(() => ({ toArray: marketplaceItemsToArray }));
 
+const playerStatsFindOne = jest.fn(async (): Promise<unknown> => null);
+
 jest.mock('@server/lib/mongodb', () => ({
   connectToMongo: jest.fn(async () => ({
     userInventoryCollection: { find: userInventoryFind },
     nftLootCollection: { find: nftLootFind },
     materialTokensCollection: { find: materialTokensFind },
     marketplaceItemsCollection: { find: marketplaceItemsFind },
+    playerStatsCollection: { findOne: playerStatsFindOne },
   })),
 }));
 
@@ -32,6 +35,7 @@ import cookieParser from 'cookie-parser';
 import request from 'supertest';
 import { inventoryRouter } from '@server/routes/inventory';
 import { createJWT } from '@server/lib/jwt';
+import { ObjectId } from 'mongodb';
 
 function appWithInventoryRouter() {
   const app = express();
@@ -103,5 +107,54 @@ describe('GET /api/inventory/get', () => {
     expect(res.body.success).toBe(true);
     expect(res.body.totalItems).toBe(0);
     expect(res.body.inventory).toEqual([]);
+  });
+
+  it('excludes equipped items when excludeEquipped=true', async () => {
+    const equippedId = new ObjectId();
+    const looseId = new ObjectId();
+    const item = (_id: ObjectId) => ({ _id, userId: 'user-123', lootTableId: 'spirit_crystal', tier: 1, acquiredAt: new Date() });
+    userInventoryToArray.mockResolvedValueOnce([item(equippedId), item(looseId)]);
+    materialTokensToArray.mockResolvedValueOnce([]);
+    playerStatsFindOne.mockResolvedValueOnce({ userId: 'user-123', equippedItems: { accessory1: equippedId } });
+
+    const res = await request(appWithInventoryRouter())
+      .get('/api/inventory/get?excludeEquipped=true')
+      .set('Cookie', await authCookie());
+
+    expect(res.status).toBe(200);
+    expect(res.body.inventory.map((i: { inventoryId: string }) => i.inventoryId)).toEqual([looseId.toHexString()]);
+    expect(playerStatsFindOne).toHaveBeenCalledWith({ userId: 'user-123' });
+  });
+
+  it('excludes items whose listing is mid-purchase (pending) when excludeListed=true', async () => {
+    const id = new ObjectId();
+    userInventoryToArray.mockResolvedValueOnce([{ _id: id, userId: 'user-123', lootTableId: 'common_coin', tier: 1, acquiredAt: new Date() }]);
+    materialTokensToArray.mockResolvedValueOnce([]);
+    marketplaceItemsToArray.mockResolvedValueOnce([{ sellerId: 'user-123', status: 'pending', inventoryItemId: id.toHexString() }]);
+
+    const res = await request(appWithInventoryRouter())
+      .get('/api/inventory/get?excludeListed=true')
+      .set('Cookie', await authCookie());
+
+    expect(res.body.inventory).toEqual([]);
+    expect(marketplaceItemsFind).toHaveBeenCalledWith({ sellerId: 'user-123', status: { $in: ['active', 'pending'] } });
+  });
+
+  it("reports the inventory doc's tokenId, not a stale NFTLoot one (a purchase moves only the inventory doc)", async () => {
+    const nftLootId = new ObjectId();
+    userInventoryToArray.mockResolvedValueOnce([
+      { _id: new ObjectId(), userId: 'user-123', lootTableId: 'spirit_crystal', tier: 1, acquiredAt: new Date(), nftLootId, tokenId: 'BUYERTX.0' },
+    ]);
+    nftLootToArray.mockResolvedValueOnce([{ _id: nftLootId, mintOutpoint: 'MINT.0', tokenId: 'ORDLOCKTX.0' }]);
+    materialTokensToArray.mockResolvedValueOnce([]);
+
+    const res = await request(appWithInventoryRouter())
+      .get('/api/inventory/get')
+      .set('Cookie', await authCookie());
+
+    expect(res.body.inventory[0]).toEqual(expect.objectContaining({ tokenId: 'BUYERTX.0', currentTokenId: 'BUYERTX.0' }));
+    // Only the doc's own mintOutpoint is the token's id; transfers are checked against it, so no NFTLoot fallback.
+    expect(res.body.inventory[0].mintOutpoint).toBeUndefined();
+    expect(res.body.inventory[0].mintTransactionId).toBe('MINT');
   });
 });

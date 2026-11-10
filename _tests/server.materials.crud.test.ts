@@ -2,9 +2,9 @@
 // and mounts materialsRouter directly at '/api/materials', independent of
 // buildApp()/mountRoutes(). POST /check-token uses the REAL requireSession middleware +
 // a REAL JWT (via createJWT) set as the `verified` cookie, mirroring
-// _tests/server.battle.test.ts. POST /update-tokens uses the REAL requireAuthProof
-// middleware; its lower-level dependencies (getServerWallet, authServer.verifyAuthProof,
-// consumeNonce) are mocked, mirroring _tests/server.challenge.test.ts.
+// _tests/server.battle.test.ts. POST /update-tokens was removed (CRIT-2); its test sends a
+// valid proof (requireAuthProof deps mocked, mirroring _tests/server.challenge.test.ts) to
+// prove the 404 isn't an auth rejection.
 // connectToMongo is mocked per test. The wallet-mutating deps used by the existing
 // mint-and-transfer/add-and-merge routes in this file are untouched and unused here.
 
@@ -15,7 +15,6 @@ jest.mock('@server/lib/authNonceStore', () => ({ consumeNonce: jest.fn() }));
 const materialTokensFindOne = jest.fn();
 const materialTokensUpdateOne = jest.fn(async () => ({ modifiedCount: 1 }));
 const materialTokensDeleteOne = jest.fn(async () => ({ deletedCount: 1 }));
-const userInventoryDeleteMany = jest.fn(async () => ({ deletedCount: 1 }));
 
 jest.mock('@server/lib/mongodb', () => ({
   connectToMongo: jest.fn(async () => ({
@@ -24,7 +23,6 @@ jest.mock('@server/lib/mongodb', () => ({
       updateOne: materialTokensUpdateOne,
       deleteOne: materialTokensDeleteOne,
     },
-    userInventoryCollection: { deleteMany: userInventoryDeleteMany },
   })),
 }));
 
@@ -70,6 +68,7 @@ describe('POST /api/materials/check-token', () => {
   it('200s and returns the existing token (happy path)', async () => {
     materialTokensFindOne.mockResolvedValueOnce({
       tokenId: 'abcd.0',
+      mintOutpoint: 'mint.0',
       quantity: 5,
       keyId: 'NONCE1',
       counterparty: 'SERVER_ID',
@@ -85,6 +84,7 @@ describe('POST /api/materials/check-token', () => {
       exists: true,
       token: {
         tokenId: 'abcd.0',
+        mintOutpoint: 'mint.0',
         quantity: 5,
         keyId: 'NONCE1',
         counterparty: 'SERVER_ID',
@@ -121,119 +121,23 @@ describe('POST /api/materials/check-token', () => {
   });
 });
 
-describe('POST /api/materials/update-tokens', () => {
+describe('POST /api/materials/update-tokens (removed: CRIT-2)', () => {
   beforeEach(() => jest.clearAllMocks());
 
-  it('401s with no proof present in the body', async () => {
-    const res = await request(appWithMaterialsRouter())
-      .post('/api/materials/update-tokens')
-      .set('Cookie', await authCookie())
-      .send({ updates: [{ lootTableId: 'iron_ore', previousTokenId: 'abcd.0', newQuantity: 3 }] }); // no `proof`
-
-    expect(res.status).toBe(401);
-    expect(res.body).toEqual({ error: 'Auth proof required' });
-    expect(materialTokensUpdateOne).not.toHaveBeenCalled();
-  });
-
-  it('400s when updates array is missing (valid proof, reaches handler)', async () => {
+  it('404s so client-declared token quantities can never be written', async () => {
     seedValidProof();
-
-    const res = await request(appWithMaterialsRouter())
-      .post('/api/materials/update-tokens')
-      .set('Cookie', await authCookie())
-      .send({ proof: {} });
-
-    expect(res.status).toBe(400);
-    expect(res.body).toEqual({ error: 'Invalid or empty updates array' });
-    expect(materialTokensUpdateOne).not.toHaveBeenCalled();
-  });
-
-  it('200s and updates the token quantity/state (happy path)', async () => {
-    seedValidProof();
-    materialTokensFindOne.mockResolvedValueOnce({
-      _id: 'TOKEN_OID',
-      userId: 'user-123',
-      lootTableId: 'iron_ore',
-      tokenId: 'abcd.0',
-      quantity: 5,
-    });
+    materialTokensFindOne.mockResolvedValueOnce({ _id: 'TOKEN_OID', userId: 'user-123', lootTableId: 'iron_ore', tokenId: 'abcd.0', quantity: 5 });
 
     const res = await request(appWithMaterialsRouter())
       .post('/api/materials/update-tokens')
       .set('Cookie', await authCookie())
       .send({
         proof: {},
-        updates: [
-          {
-            lootTableId: 'iron_ore',
-            itemName: 'Iron Ore',
-            previousTokenId: 'abcd.0',
-            newTokenId: 'efgh.0',
-            transactionId: 'TXID1',
-            previousQuantity: 5,
-            newQuantity: 8,
-            operation: 'add',
-          },
-        ],
+        updates: [{ lootTableId: 'iron_ore', previousTokenId: 'abcd.0', newTokenId: 'deadbeef.0', transactionId: 'deadbeef', newQuantity: 999999, operation: 'set' }],
       });
 
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ success: true, count: 1 });
-    expect(materialTokensUpdateOne).toHaveBeenCalledWith(
-      { _id: 'TOKEN_OID' },
-      {
-        $set: {
-          tokenId: 'efgh.0',
-          quantity: 8,
-          previousTokenId: 'abcd.0',
-          lastTransactionId: 'TXID1',
-          updatedAt: expect.any(Date),
-        },
-        $push: {
-          updateHistory: {
-            operation: 'add',
-            previousQuantity: 5,
-            newQuantity: 8,
-            transactionId: 'TXID1',
-            reason: null,
-            timestamp: expect.any(Date),
-          },
-        },
-      },
-    );
+    expect(res.status).toBe(404);
+    expect(materialTokensUpdateOne).not.toHaveBeenCalled();
     expect(materialTokensDeleteOne).not.toHaveBeenCalled();
-  });
-
-  it('deletes the token when newQuantity is 0 (burned)', async () => {
-    seedValidProof();
-    materialTokensFindOne.mockResolvedValueOnce({
-      _id: 'TOKEN_OID',
-      userId: 'user-123',
-      lootTableId: 'iron_ore',
-      tokenId: 'abcd.0',
-      quantity: 5,
-    });
-
-    const res = await request(appWithMaterialsRouter())
-      .post('/api/materials/update-tokens')
-      .set('Cookie', await authCookie())
-      .send({
-        proof: {},
-        updates: [
-          {
-            lootTableId: 'iron_ore',
-            previousTokenId: 'abcd.0',
-            transactionId: 'TXID2',
-            previousQuantity: 5,
-            newQuantity: 0,
-            operation: 'subtract',
-          },
-        ],
-      });
-
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ success: true, count: 1 });
-    expect(materialTokensDeleteOne).toHaveBeenCalledWith({ _id: 'TOKEN_OID' });
-    expect(materialTokensUpdateOne).not.toHaveBeenCalled();
   });
 });

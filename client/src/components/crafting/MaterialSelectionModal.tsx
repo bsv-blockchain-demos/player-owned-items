@@ -1,7 +1,7 @@
 
 import { useEffect, useState } from 'react';
 import { apiFetch } from '@/lib/apiFetch';
-import { CraftingRecipe, MaterialRequirement } from '@/shared/recipe-table';
+import { CraftingRecipe, MaterialRequirement } from '@shared/recipe-table';
 import { getLootItemById } from '@shared/loot-table';
 import { TierBadge, EmpoweredBadge } from '@/components/badges';
 import toast from 'react-hot-toast';
@@ -24,6 +24,8 @@ interface InventoryMaterial {
   transactionId?: string;
   isMaterialToken: boolean;
   materialTokenId?: string;
+  inscribed: boolean;
+  crafted: boolean;
 }
 
 export default function MaterialSelectionModal({ recipe, onClose, onCraft }: MaterialSelectionModalProps) {
@@ -39,15 +41,15 @@ export default function MaterialSelectionModal({ recipe, onClose, onCraft }: Mat
     try {
       setLoading(true);
       // Only fetch minted materials (backend filtering)
-      const response = await apiFetch('/api/inventory/get?mintedOnly=true');
+      const response = await apiFetch('/api/inventory/get?mintedOnly=true&excludeListed=true&excludeEquipped=true'); // listed tokens sit in an OrdLock; equipped items can't be consumed
       const data = await response.json();
 
       if (response.ok && data.success) {
-        // Backend already filters for minted items, this is a safety check
+        // Material tokens, plus item NFTs (one unit each) for artifact requirements
         const materials = data.inventory
           .filter((item: any) => {
             const lootItem = getLootItemById(item.lootId);
-            return lootItem && lootItem.type === 'material' && item.tokenId;
+            return lootItem && item.tokenId && (lootItem.type === 'material' || item.nftLootId);
           })
           .map((item: any) => ({
             _id: item.inventoryId, // API returns inventoryId, not _id
@@ -60,7 +62,9 @@ export default function MaterialSelectionModal({ recipe, onClose, onCraft }: Mat
             tokenId: item.tokenId,
             transactionId: item.transactionId,
             isMaterialToken: item.isMaterialToken || false,
-            materialTokenId: item.materialTokenId
+            materialTokenId: item.materialTokenId,
+            inscribed: Boolean(item.prefix || item.suffix),
+            crafted: Boolean(item.crafted),
           }));
 
         setUserMaterials(materials);
@@ -296,6 +300,13 @@ export default function MaterialSelectionModal({ recipe, onClose, onCraft }: Mat
                         {mat.quantity > 1 && (
                           <div className="absolute bottom-12 left-1/2 transform -translate-x-1/2 px-2 py-1 bg-blue-600 rounded-lg text-xs font-bold border-2 border-blue-400">
                             x{mat.quantity}
+                          </div>
+                        )}
+
+                        {/* Crafting consumes the item, rolls and inscriptions included */}
+                        {(mat.inscribed || mat.crafted) && (
+                          <div className="text-xs font-bold text-amber-300 text-center mb-1">
+                            {mat.inscribed ? 'Inscribed' : 'Crafted'}
                           </div>
                         )}
 
