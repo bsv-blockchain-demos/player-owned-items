@@ -13,6 +13,7 @@ const beefsDeleteOne = jest.fn(async () => ({ deletedCount: 1 }));
 const inventoryUpdateOne = jest.fn(async () => ({ modifiedCount: 1 }));
 const materialUpdateOne = jest.fn(async () => ({ modifiedCount: 1 }));
 const usersFindOne = jest.fn(async () => ({ userId: 'buyer' }));
+const playerStatsUpdateOne = jest.fn(async (_f: any, _u: any, _o?: any) => ({ modifiedCount: 0 }));
 
 const endSession = jest.fn(async () => {});
 const startSession = jest.fn(() => ({
@@ -28,6 +29,7 @@ jest.mock('@server/lib/mongodb', () => ({
     userInventoryCollection: { updateOne: inventoryUpdateOne },
     materialTokensCollection: { updateOne: materialUpdateOne },
     usersCollection: { findOne: usersFindOne },
+    playerStatsCollection: { updateOne: playerStatsUpdateOne },
   })),
   getClient,
 }));
@@ -76,6 +78,7 @@ jest.mock('@bsv/sdk', () => ({
 }));
 
 import request from 'supertest';
+import { ObjectId } from 'mongodb';
 import { buildApp } from '@server/app';
 import { Transaction } from '@bsv/sdk';
 import { broadcastTX } from '@shared/overlayFunctions';
@@ -281,6 +284,14 @@ describe('POST /api/marketplace/purchase-listing', () => {
       expect.anything(),
     );
     expect(materialUpdateOne).not.toHaveBeenCalled();
+    // The seller's slot may still point at the sold doc (equipped after listing); clear it in the same transaction.
+    for (const slot of ['weapon', 'armor', 'accessory1', 'accessory2']) {
+      expect(playerStatsUpdateOne).toHaveBeenCalledWith(
+        { userId: 'seller', [`equippedItems.${slot}`]: new ObjectId('507f1f77bcf86cd799439099') },
+        { $unset: { [`equippedItems.${slot}`]: '' } },
+        expect.anything(),
+      );
+    }
 
     // Wallet work happened BEFORE the DB finalize.
     expect(enqueue.mock.invocationCallOrder[0]).toBeLessThan(itemsUpdateOne.mock.invocationCallOrder[0]);

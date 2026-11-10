@@ -66,6 +66,7 @@ const userInventoryFindOne = jest.fn();
 const userInventoryUpdateOne = jest.fn(async () => ({ modifiedCount: 1 }));
 const materialTokensFindOne = jest.fn();
 const materialTokensUpdateOne = jest.fn(async (_filter: any, _update: any) => ({ modifiedCount: 1 }));
+const playerStatsFindOne = jest.fn(async (): Promise<unknown> => null);
 
 jest.mock('@server/lib/mongodb', () => ({
   connectToMongo: jest.fn(async () => ({
@@ -85,6 +86,7 @@ jest.mock('@server/lib/mongodb', () => ({
     nftLootCollection: { updateOne: nftLootUpdateOne },
     userInventoryCollection: { findOne: userInventoryFindOne, updateOne: userInventoryUpdateOne },
     materialTokensCollection: { findOne: materialTokensFindOne, updateOne: materialTokensUpdateOne },
+    playerStatsCollection: { findOne: playerStatsFindOne },
   })),
   getClient: jest.fn(),
 }));
@@ -440,6 +442,17 @@ describe('POST /api/marketplace/list-item (item a craft may claim)', () => {
       .post('/api/marketplace/list-item')
       .set('Cookie', await authCookie())
       .send(itemBody);
+
+  it('409s when the item is equipped (the sale would leave the seller\'s slot on the buyer\'s item)', async () => {
+    userInventoryFindOne.mockResolvedValueOnce(ownedItem);
+    playerStatsFindOne.mockResolvedValueOnce({ userId: 'user-123', equippedItems: { accessory2: new ObjectId(ITEM_OID) } });
+
+    const res = await post();
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'Unequip the item before listing it' });
+    expect(itemsInsertOne).not.toHaveBeenCalled();
+  });
 
   it('409s when a craft holds a claim on the item', async () => {
     userInventoryFindOne.mockResolvedValueOnce({ ...ownedItem, pendingClaim: 'CLAIM' });

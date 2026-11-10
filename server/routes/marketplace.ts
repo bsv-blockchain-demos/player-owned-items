@@ -19,7 +19,7 @@ import { broadcastTX, getTransactionByTxID } from '@shared/overlayFunctions';
 import { decodeBeef, encodeBeef } from '@shared/beefEncoding';
 import { generateNonce, deriveRecipientKey } from '@shared/tokenDerivation';
 import { getLootItemById, type LootItem, type EquipmentStats } from '@shared/loot-table';
-import type { MarketplaceItem } from '@shared/types';
+import { EQUIPMENT_SLOTS, type MarketplaceItem } from '@shared/types';
 import { TOKEN_CLAIM_FAILED } from '@server/lib/materialUnits';
 
 export const marketplaceRouter = Router();
@@ -38,7 +38,7 @@ marketplaceRouter.post('/purchase-listing', requireAuthProof('purchase'), async 
     return;
   }
 
-  const { marketplaceItemsCollection, marketplaceListingBeefsCollection, userInventoryCollection, materialTokensCollection, usersCollection } = await connectToMongo();
+  const { marketplaceItemsCollection, marketplaceListingBeefsCollection, userInventoryCollection, materialTokensCollection, usersCollection, playerStatsCollection } = await connectToMongo();
 
   const listingObjectId = new ObjectId(listingId);
 
@@ -338,6 +338,15 @@ marketplaceRouter.post('/purchase-listing', requireAuthProof('purchase'), async 
 
       // Transfer item ownership in database
       if (listing.inventoryItemId) {
+        // The seller may have equipped it after listing; their slot must not keep the buyer's item.
+        for (const slot of EQUIPMENT_SLOTS) {
+          await playerStatsCollection.updateOne(
+            { userId: listing.sellerId, [`equippedItems.${slot}`]: new ObjectId(listing.inventoryItemId) },
+            { $unset: { [`equippedItems.${slot}`]: '' } },
+            { session: dbSession },
+          );
+        }
+
         // Transfer inventory item to buyer
         await userInventoryCollection.updateOne(
           { _id: new ObjectId(listing.inventoryItemId) },
@@ -618,7 +627,8 @@ marketplaceRouter.post('/list-item', requireAuthProof('list'), async (req: Reque
       userInventoryCollection,
       materialTokensCollection,
       marketplaceItemsCollection,
-      marketplaceListingBeefsCollection
+      marketplaceListingBeefsCollection,
+      playerStatsCollection
     } = await connectToMongo();
 
     // Get user info
@@ -678,6 +688,13 @@ marketplaceRouter.post('/list-item', requireAuthProof('list'), async (req: Reque
       // A craft is spending it.
       if (item.pendingClaim) {
         res.status(409).json({ error: TOKEN_CLAIM_FAILED });
+        return;
+      }
+
+      // Selling an equipped item would leave the seller's slot on the buyer's item.
+      const playerStats = await playerStatsCollection.findOne({ userId });
+      if (Object.values(playerStats?.equippedItems ?? {}).some((id) => id && String(id) === item._id.toHexString())) {
+        res.status(409).json({ error: 'Unequip the item before listing it' });
         return;
       }
 
