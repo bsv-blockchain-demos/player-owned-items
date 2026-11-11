@@ -61,7 +61,7 @@ jest.mock('@bsv/sdk', () => ({
 }));
 
 import request from 'supertest';
-import { inscribedScript } from './helpers/ordinalScript';
+import { inscribedScript, tokenInput } from './helpers/ordinalScript';
 import { ObjectId } from 'mongodb';
 import { buildApp } from '@server/app';
 import { Transaction } from '@bsv/sdk';
@@ -102,7 +102,7 @@ const inscribed = (hex: string, amt: number, lootTableId: string, assetId: strin
 /** payment tx + transfer tx — reached by every request past field validation. */
 function seedPaymentAndTransferMocks(
   transferScriptHex: string,
-  inputs = [{ sourceTXID: 'USERTOKEN', sourceOutputIndex: 0 }],
+  inputs: unknown[] = [tokenInput('USERTOKEN', 0, { op: 'transfer', amt: 5, id: 'STACKMINT_0' })],
   amt = 5,
   lootTableId = 'phoenix_feather',
   assetId = 'STACKMINT_0',
@@ -290,7 +290,7 @@ describe('POST /api/materials/add-and-merge', () => {
       .mockReturnValueOnce({ id: () => 'PAYTXID', outputs: [{ satoshis: 100 }] })
       .mockReturnValueOnce({
         id: () => 'TXID1',
-        inputs: [{ sourceTXID: 'USERTOKEN', sourceOutputIndex: 0 }],
+        inputs: [tokenInput('USERTOKEN', 0, { op: 'transfer', amt: 5, id: 'STACKMINT_0' })],
         outputs: [
           { lockingScript: inscribed('LOCKSCRIPT_CONTAINS_PS_MARKER', 5, 'phoenix_feather', 'STACKMINT_0') },
           { lockingScript: inscribed('USER_OWN_LOCK', 5, 'phoenix_feather', 'STACKMINT_0') },
@@ -300,6 +300,14 @@ describe('POST /api/materials/add-and-merge', () => {
     const res = await request(buildApp()).post('/api/materials/add-and-merge').send(validBody);
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: 'Output 1 also carries asset STACKMINT_0' });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('400 when the spent output holds another amount than the stack (DB drifted from chain)', async () => {
+    seedPaymentAndTransferMocks('LOCKSCRIPT_CONTAINS_PS_MARKER', [tokenInput('USERTOKEN', 0, { op: 'transfer', amt: 8, id: 'STACKMINT_0' })]);
+    const res = await request(buildApp()).post('/api/materials/add-and-merge').send(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Transfer spends an output that is not the stack on chain' });
     expect(enqueue).not.toHaveBeenCalled();
   });
 

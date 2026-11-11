@@ -25,7 +25,7 @@ import { getLootItemById } from '@shared/loot-table';
 import { EQUIPMENT_SLOTS, type Inscription, type InscriptionData, type UserInventory } from '@shared/types';
 import { serverLockPattern, checkBatchTransfer } from '@server/lib/batchTransfer';
 import { mintAssetId } from '@server/lib/tokenScript';
-import { EXCLUSIVE_INSCRIPTION_TYPES } from '@shared/inscriptions';
+import { EXCLUSIVE_INSCRIPTION_TYPES, inscriptionGoldCost } from '@shared/inscriptions';
 import {
   parseInventoryIds,
   claimTokens,
@@ -111,7 +111,7 @@ equipmentRouter.post('/update', requireAuthProof('update-equipment'), async (req
     return;
   }
 
-  const scrolls: Array<{ doc: WithId<UserInventory>; data: InscriptionData }> = [];
+  const scrolls: Array<{ doc: WithId<UserInventory>; data: InscriptionData; rarity: string }> = [];
   for (const scrollId of scrollIds) {
     const doc = await findMinted(scrollId);
     if (!doc) {
@@ -123,7 +123,7 @@ equipmentRouter.post('/update', requireAuthProof('update-equipment'), async (req
       res.status(400).json({ error: 'Selected item is not an inscription scroll' });
       return;
     }
-    scrolls.push({ doc, data: scrollLoot.inscriptionData });
+    scrolls.push({ doc, data: scrollLoot.inscriptionData, rarity: scrollLoot.rarity });
   }
   if (new Set(scrolls.map((s) => s.data.slot)).size !== scrolls.length) {
     res.status(400).json({ error: 'One inscription scroll per slot' });
@@ -234,6 +234,18 @@ equipmentRouter.post('/update', requireAuthProof('update-equipment'), async (req
     return;
   }
 
+  // Same gold cost as /api/inscriptions/apply, taken only if the player has it; refunded if the wallet fails.
+  const goldCost = scrolls.reduce((sum, s) => sum + inscriptionGoldCost(s.rarity), 0);
+  const { modifiedCount: charged } = await playerStatsCollection.updateOne(
+    { userId, coins: { $gte: goldCost } },
+    { $inc: { coins: -goldCost } },
+  );
+  if (charged !== 1) {
+    await releaseTokens(userInventoryCollection, claimId);
+    res.status(400).json({ error: `Insufficient gold. Need ${goldCost} gold to apply these inscriptions.` });
+    return;
+  }
+
   // ALL wallet UTXO-touching work runs inside the serialized queue.
   const result = await queue.enqueue('update:equipment', async (serverWallet) => {
     // Single unlock template shared by all transferred ordinal inputs (they share N2)
@@ -335,6 +347,7 @@ equipmentRouter.post('/update', requireAuthProof('update-equipment'), async (req
     };
   }).catch(async (err) => {
     await releaseTokens(userInventoryCollection, claimId);
+    await playerStatsCollection.updateOne({ userId }, { $inc: { coins: goldCost } });
     throw err;
   });
 

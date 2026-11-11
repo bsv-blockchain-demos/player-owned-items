@@ -100,6 +100,31 @@ export async function anyTokenListed(
   return listing !== null;
 }
 
+/**
+ * Filter for the user's material stacks a mint can merge into. A listed or mid-purchase stack
+ * sits in an OrdLock and a claimed one is being spent, so neither can be merged into; if no
+ * other stack exists the mint makes a fresh one (several stacks per tier are normal).
+ */
+export async function mergeableStackFilter(
+  listings: Collection<MarketplaceItem>,
+  userId: string,
+  lootTableId: string,
+  tier: Tier,
+): Promise<Filter<MaterialToken>> {
+  const live = await listings
+    .find({ sellerId: userId, materialTokenId: { $exists: true }, status: { $in: ['active', 'pending'] } })
+    .toArray();
+  return {
+    userId,
+    // $eq: a value from a request body is matched literally, never read as an operator.
+    lootTableId: { $eq: lootTableId },
+    tier: { $eq: tier },
+    consumed: { $ne: true },
+    pendingClaim: { $exists: false },
+    _id: { $nin: live.map((l) => new ObjectId(l.materialTokenId!)) },
+  };
+}
+
 /** The vout of `outpoint` if it is exactly `${txid}.${canonical vout}`, else null. */
 export function voutOf(outpoint: string, txid: string): number | null {
   const [id, vout, ...rest] = outpoint.split('.');

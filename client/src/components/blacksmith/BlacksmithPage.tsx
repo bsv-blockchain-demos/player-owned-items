@@ -6,7 +6,8 @@ import toast from 'react-hot-toast';
 import { tierToRoman } from '@/shared/tierUtils';
 import { getInscribedItemName, getInscriptionStatLabel, formatInscriptionStat, getInscriptionRarityColor } from '@/shared/itemNameHelpers';
 import type { Inscription } from '@shared/types';
-import { inscriptionConflict } from '@shared/inscriptions';
+import { inscriptionConflict, inscriptionGoldCost } from '@shared/inscriptions';
+import { usePlayer } from '@/contexts/PlayerContext';
 import { useUpdateEquipmentNFT } from '@/hooks/useUpdateEquipmentNFT';
 import { useAuthContext } from '@/contexts/WalletContext';
 import { useEquipment } from '@/contexts/EquipmentContext';
@@ -49,6 +50,7 @@ export default function BlacksmithPage() {
   const { updateEquipmentNFT, isUpdating } = useUpdateEquipmentNFT();
   const { userWallet, isAuthenticated } = useAuthContext();
   const { refreshEquipment } = useEquipment();
+  const { playerStats, fetchPlayerStats } = usePlayer();
 
   useEffect(() => {
     fetchInventory();
@@ -142,6 +144,10 @@ export default function BlacksmithPage() {
         const conflict = inscriptionConflict(selectedEquipment, scrollData.inscriptionData);
         if (conflict) {
           throw new Error(`Cannot have both ${conflict} prefix and suffix on the same item`);
+        }
+        const goldCost = inscriptionGoldCost(scrollData.rarity);
+        if ((playerStats?.coins ?? 0) < goldCost) {
+          throw new Error(`Insufficient gold. Need ${goldCost} gold to apply this inscription.`);
         }
 
         const inscriptionType = scrollData.inscriptionData.slot;
@@ -274,7 +280,8 @@ export default function BlacksmithPage() {
         await refreshEquipment();
       }
 
-      // Reset selections and refresh
+      // Reset selections and refresh (gold was spent)
+      fetchPlayerStats();
       setSelectedEquipment(null);
       setSelectedScroll(null);
       setOverwriteWarning(null);
@@ -286,16 +293,6 @@ export default function BlacksmithPage() {
     } finally {
       setApplying(false);
     }
-  };
-
-  const getInscriptionGoldCost = (rarity: string): number => {
-    const costs: Record<string, number> = {
-      common: 250,
-      rare: 1000,
-      epic: 2500,
-      legendary: 5000
-    };
-    return costs[rarity] || 250;
   };
 
   const getRarityColor = (rarity: string) => {
@@ -543,7 +540,7 @@ export default function BlacksmithPage() {
               {/* Selected Scroll */}
               {selectedScroll && (() => {
                 const lootItem = getLootItemById(selectedScroll.lootTableId);
-                const goldCost = lootItem ? getInscriptionGoldCost(lootItem.rarity) : 0;
+                const goldCost = lootItem ? inscriptionGoldCost(lootItem.rarity) : 0;
                 return lootItem?.inscriptionData ? (
                   <div className="bg-gray-900/50 rounded-lg p-4 border-2 border-gray-600">
                     <div className="text-sm text-gray-400 mb-2">Inscription:</div>
@@ -571,7 +568,7 @@ export default function BlacksmithPage() {
               {/* Apply Button */}
               {selectedEquipment && selectedScroll && (() => {
                 const lootItem = getLootItemById(selectedScroll.lootTableId);
-                const goldCost = lootItem ? getInscriptionGoldCost(lootItem.rarity) : 0;
+                const goldCost = lootItem ? inscriptionGoldCost(lootItem.rarity) : 0;
                 return (
                   <button
                     onClick={() => handleApplyInscription(false)}

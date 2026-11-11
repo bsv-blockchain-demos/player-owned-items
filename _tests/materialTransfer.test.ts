@@ -4,6 +4,7 @@ import { PrivateKey, LockingScript } from '@bsv/sdk';
 import { OrdinalsP2PKH } from '@shared/ordinalP2PKH';
 import { voutOf } from '@server/lib/materialUnits';
 import { tokenMetadata, transferAmount, inscribedAssetId, mintAssetId } from '@server/lib/tokenScript';
+import { spendsRecordedToken } from '@server/lib/batchTransfer';
 
 const pubKey = PrivateKey.fromRandom().toPublicKey().toString();
 const metadata = { name: 'material_token', lootTableId: 'common_wood', tier: 1 };
@@ -87,5 +88,35 @@ describe('mintAssetId', () => {
 
   it('is null without a recorded mint', () => {
     expect(mintAssetId(undefined)).toBeNull();
+  });
+});
+
+describe('spendsRecordedToken', () => {
+  // A crafting change output: transfer of the stack's mint id, at a non-zero vout of the craft tx.
+  const change = new OrdinalsP2PKH().lock(pubKey, 'WOODMINT_0', metadata, 'transfer', 7);
+  const spending = (script: LockingScript, vout = 1) =>
+    ({
+      sourceTXID: 'CRAFTTX',
+      sourceOutputIndex: vout,
+      sourceTransaction: { outputs: [{ lockingScript: parsed(new OrdinalsP2PKH().lock(pubKey, 'MINTTX_0', metadata, 'transfer', 1)) }, { lockingScript: parsed(script) }] },
+    }) as any;
+
+  it('accepts a change output the doc records', () => {
+    expect(spendsRecordedToken(spending(change), 'WOODMINT.0', 7)).toBe(true);
+  });
+
+  it.each([
+    ['another amount', 'WOODMINT.0', 6, 1],
+    ['another mint', 'OTHERMINT.0', 7, 1],
+    ['another output of the same tx', 'WOODMINT.0', 7, 0],
+  ])('rejects %s', (_label, mintOutpoint, amount, vout) => {
+    expect(spendsRecordedToken(spending(change, vout), mintOutpoint, amount)).toBe(false);
+  });
+
+  it('expects a deploy+mint at the mint outpoint, and only there', () => {
+    const mint = new OrdinalsP2PKH().lock(pubKey, '', metadata, 'deploy+mint', 7);
+    expect(spendsRecordedToken(spending(mint), 'CRAFTTX.1', 7)).toBe(true);
+    expect(spendsRecordedToken(spending(mint), 'WOODMINT.0', 7)).toBe(false);
+    expect(spendsRecordedToken(spending(change), 'CRAFTTX.1', 7)).toBe(false); // a transfer is not a mint
   });
 });

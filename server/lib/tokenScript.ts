@@ -39,7 +39,7 @@ const parseObject = (data: number[]): Record<string, unknown> | null => {
 };
 
 /** The bsv-20 inscription JSON in the script's ord envelope (chunks 2 and 6), or null. */
-function inscription(script: ParsedScript): Record<string, unknown> | null {
+export function bsv20Inscription(script: ParsedScript): Record<string, unknown> | null {
   const [, , marker, , , , body] = script.chunks;
   if (!marker?.data || !body?.data || Buffer.from(marker.data).toString('utf8') !== 'ord') return null;
   return parseObject(body.data);
@@ -47,13 +47,13 @@ function inscription(script: ParsedScript): Record<string, unknown> | null {
 
 /** The amount of a bsv-20 transfer inscription, or null if the script carries none. */
 export function transferAmount(script: ParsedScript): number | null {
-  const ins = inscription(script);
+  const ins = bsv20Inscription(script);
   return ins?.op === 'transfer' && Number.isInteger(ins.amt) ? (ins.amt as number) : null;
 }
 
 /** The asset id a bsv-20 transfer inscription names, or null. */
 export function inscribedAssetId(script: ParsedScript): string | null {
-  const ins = inscription(script);
+  const ins = bsv20Inscription(script);
   return ins?.op === 'transfer' && typeof ins.id === 'string' ? ins.id : null;
 }
 

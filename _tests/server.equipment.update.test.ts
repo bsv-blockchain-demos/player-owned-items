@@ -68,7 +68,7 @@ jest.mock('@bsv/sdk', () => ({
 }));
 
 import request from 'supertest';
-import { inscribedScript } from './helpers/ordinalScript';
+import { inscribedScript, tokenInput } from './helpers/ordinalScript';
 import { buildApp } from '@server/app';
 import { ObjectId } from 'mongodb';
 import { Transaction } from '@bsv/sdk';
@@ -113,15 +113,15 @@ const validBody = {
 
 const inscribed = (hex: string, amt: number, lootTableId: string, assetId: string) => inscribedScript(hex, amt, { lootTableId }, assetId);
 const defaultInputs = [
-  { sourceTXID: 'ORIGTX', sourceOutputIndex: 0 },
-  { sourceTXID: 'SCROLLPTX', sourceOutputIndex: 0 },
-  { sourceTXID: 'SCROLLSTX', sourceOutputIndex: 0 },
+  tokenInput('ORIGTX', 0, { op: 'transfer', amt: 1, id: 'ORIGMINT_0' }),
+  tokenInput('SCROLLPTX', 0, { op: 'transfer', amt: 1, id: 'SCROLLPMINT_0' }),
+  tokenInput('SCROLLSTX', 0, { op: 'transfer', amt: 1, id: 'SCROLLSMINT_0' }),
 ];
 
 /** payment tx + batch-transfer tx — reached by every request past the DB checks. */
 function seedPaymentAndBatchMocks(
   scripts = ['LOCK_PS_0', 'LOCK_PS_1', 'LOCK_PS_2'],
-  inputs = defaultInputs,
+  inputs: unknown[] = defaultInputs,
   amts = [1, 1, 1],
   lootIds = ['common_dagger', 'prefix_damage_common', 'suffix_damage_common'],
   assetIds = ['ORIGMINT_0', 'SCROLLPMINT_0', 'SCROLLSMINT_0'],
@@ -337,6 +337,14 @@ describe('POST /api/equipment/update', () => {
     expectNotClaimed();
   });
 
+  it('400 when a spent scroll output is another asset on chain', async () => {
+    seedPaymentAndBatchMocks(undefined, [...defaultInputs.slice(0, 2), tokenInput('SCROLLSTX', 0, { op: 'transfer', amt: 1, id: 'OTHERMINT_0' })]);
+    const res = await post(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Scroll suffix_damage_common spends an output that is not this token on chain' });
+    expectNotClaimed();
+  });
+
   it('400 when a scroll has no recorded mint', async () => {
     delete ownedDocs[SCROLL_P].mintOutpoint;
     seedPaymentAndBatchMocks();
@@ -382,6 +390,28 @@ describe('POST /api/equipment/update', () => {
     );
     expect(inventoryUpdateMany).toHaveBeenLastCalledWith({ pendingClaim: claimId() }, { $unset: { pendingClaim: '' } });
     expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('400 and releases the claim when the player cannot pay the scrolls\' gold', async () => {
+    seedPaymentAndBatchMocks();
+    playerStatsUpdateOne.mockResolvedValueOnce({ modifiedCount: 0 }); // coins < cost
+    const res = await post(validBody);
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'Insufficient gold. Need 500 gold to apply these inscriptions.' });
+    expect(playerStatsUpdateOne).toHaveBeenCalledWith({ userId: 'u1', coins: { $gte: 500 } }, { $inc: { coins: -500 } });
+    expect(inventoryUpdateMany).toHaveBeenLastCalledWith({ pendingClaim: claimId() }, { $unset: { pendingClaim: '' } });
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('charges each scroll\'s gold after claiming, before the wallet runs', async () => {
+    seedPaymentAndBatchMocks();
+    seedEnqueueMocks();
+    const res = await post(validBody);
+    expect(res.status).toBe(200);
+    // two common scrolls: 250 + 250
+    expect(playerStatsUpdateOne).toHaveBeenNthCalledWith(1, { userId: 'u1', coins: { $gte: 500 } }, { $inc: { coins: -500 } });
+    expect(inventoryUpdateMany.mock.invocationCallOrder[0]).toBeLessThan(playerStatsUpdateOne.mock.invocationCallOrder[0]);
+    expect(playerStatsUpdateOne.mock.invocationCallOrder[0]).toBeLessThan(enqueue.mock.invocationCallOrder[0]);
   });
 
   it('derives the updated item from the owned docs + loot table (ignoring forged body fields)', async () => {
@@ -492,6 +522,7 @@ describe('POST /api/equipment/update', () => {
     expect(res.status).toBe(500);
     expect(res.body).toEqual({ error: 'Internal server error' });
     expect(inventoryUpdateMany).toHaveBeenLastCalledWith({ pendingClaim: claimId() }, { $unset: { pendingClaim: '' } });
+    expect(playerStatsUpdateOne).toHaveBeenLastCalledWith({ userId: 'u1' }, { $inc: { coins: 500 } }); // refund
     expect(nftInsertOne).not.toHaveBeenCalled();
     expect(inventoryDeleteOne).not.toHaveBeenCalled();
   });

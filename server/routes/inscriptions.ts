@@ -7,6 +7,10 @@ import { requireAuthProof } from '@server/middleware/requireAuthProof';
 import { ObjectId } from 'mongodb';
 import { getLootItemById } from '@shared/loot-table';
 import { Inscription } from '@shared/types';
+import { inscriptionConflict, inscriptionGoldCost } from '@shared/inscriptions';
+
+// A minted item's inscription lives on chain (/api/equipment/update); this route edits the DB only.
+const UNMINTED = { nftLootId: { $not: { $type: 'objectId' as const } } };
 
 export const inscriptionsRouter = Router();
 
@@ -101,34 +105,29 @@ inscriptionsRouter.post('/apply', requireAuthProof('inscribe'), async (req: Requ
       return;
     }
 
+    // Minted items (and only they) can be listed or claimed by a craft; editing them here
+    // would desync the chain and let a minted scroll be spent twice.
+    if (equipmentItem.nftLootId || scrollItem.nftLootId) {
+      res.status(400).json({ error: 'Minted items are inscribed on chain through the Blacksmith' });
+      return;
+    }
+
     const inscriptionData = scrollTemplate.inscriptionData;
     const slot = inscriptionData.slot; // 'prefix' or 'suffix'
 
-    // VALIDATION: Prevent both autoclick prefix AND suffix on same item
-    // VALIDATION: Prevent both lifesteal prefix AND suffix on same item
-    const exclusiveTypes = ['autoclick', 'lifesteal'];
-    if (exclusiveTypes.includes(inscriptionData.inscriptionType)) {
+    // Prevent the same autoclick/lifesteal type on both prefix and suffix
+    const conflict = inscriptionConflict(equipmentItem, inscriptionData);
+    if (conflict) {
       const oppositeSlot = slot === 'prefix' ? 'suffix' : 'prefix';
-      const oppositeInscription = equipmentItem[oppositeSlot] as Inscription | undefined;
-
-      if (oppositeInscription && oppositeInscription.type === inscriptionData.inscriptionType) {
-        const typeLabel = inscriptionData.inscriptionType === 'autoclick' ? 'autoclick' : 'lifesteal';
-        res.status(400).json({
-          error: `Cannot apply ${typeLabel} inscription`,
-          message: `This equipment already has a ${typeLabel} ${oppositeSlot}: "${oppositeInscription.name}". You cannot have both ${typeLabel} prefix and suffix on the same item.`
-        });
-        return;
-      }
+      const oppositeInscription = equipmentItem[oppositeSlot] as Inscription;
+      res.status(400).json({
+        error: `Cannot apply ${conflict} inscription`,
+        message: `This equipment already has a ${conflict} ${oppositeSlot}: "${oppositeInscription.name}". You cannot have both ${conflict} prefix and suffix on the same item.`
+      });
+      return;
     }
 
-    // Calculate gold cost based on scroll rarity
-    const goldCosts: Record<string, number> = {
-      common: 250,
-      rare: 1000,
-      epic: 2500,
-      legendary: 5000
-    };
-    const goldCost = goldCosts[scrollTemplate.rarity] || 250;
+    const goldCost = inscriptionGoldCost(scrollTemplate.rarity);
 
     // Check if player has enough gold
     if (playerStats.coins < goldCost) {
@@ -163,12 +162,12 @@ inscriptionsRouter.post('/apply', requireAuthProof('inscribe'), async (req: Requ
 
     // Apply inscription to equipment
     const updateResult = await userInventoryCollection.updateOne(
-      { _id: equipmentObjectId },
+      { _id: equipmentObjectId, userId, ...UNMINTED },
       { $set: { [slot]: inscription } }
     );
 
     if (updateResult.matchedCount === 0) {
-      res.status(500).json({ error: 'Failed to update equipment' });
+      res.status(409).json({ error: 'Equipment changed during the request' });
       return;
     }
 
@@ -179,7 +178,7 @@ inscriptionsRouter.post('/apply', requireAuthProof('inscribe'), async (req: Requ
     );
 
     // Delete consumed scroll from inventory
-    await userInventoryCollection.deleteOne({ _id: scrollObjectId });
+    await userInventoryCollection.deleteOne({ _id: scrollObjectId, userId, ...UNMINTED });
 
     // Fetch updated equipment
     const updatedEquipment = await userInventoryCollection.findOne({

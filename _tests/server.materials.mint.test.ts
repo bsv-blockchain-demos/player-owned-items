@@ -16,6 +16,7 @@ jest.mock('@server/lib/mongodb', () => ({
   connectToMongo: jest.fn(async () => ({
     materialTokensCollection: { findOne, insertOne },
     userInventoryCollection: { updateMany, deleteMany },
+    marketplaceItemsCollection: { find: () => ({ toArray: async () => [{ materialTokenId: '64b0000000000000000000aa' }] }) },
   })),
 }));
 
@@ -208,6 +209,13 @@ describe('POST /api/materials/mint-and-transfer', () => {
     expect(res.body).toHaveProperty('existingTokenId', 'existing-token');
     expect(updateMany).not.toHaveBeenCalled();
     expect(enqueue).not.toHaveBeenCalled();
+    // A listed or claimed stack can't be merged into, so it must not send the client to add-and-merge.
+    expect(findOne).toHaveBeenCalledWith(expect.objectContaining({
+      lootTableId: { $eq: 'phoenix_feather' },
+      tier: { $eq: 1 },
+      pendingClaim: { $exists: false },
+      _id: { $nin: [new ObjectId('64b0000000000000000000aa')] },
+    }));
   });
 
   it('409 and releases the claim when not every inventory unit could be claimed', async () => {

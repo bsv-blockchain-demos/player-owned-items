@@ -27,6 +27,10 @@ const MATERIAL_NOT_ITEM = 'Materials are minted as material tokens';
 const isMaterial = (item: UserInventory) =>
   item.itemType === 'material' || getLootItemById(item.lootTableId)?.type === 'material';
 
+// Labels each item mint in the server wallet's action history. The mint lock alone proves
+// nothing: BRC-42 lets the user derive the same key, so /record checks this history instead.
+const itemMintLabel = (inventoryItemId: string) => `mint item ${new ObjectId(inventoryItemId).toHexString()}`;
+
 itemsRouter.post('/mint-and-transfer', requireAuthProof('mint-item'), async (req: Request, res: Response) => {
   const userId = req.userId as string; // set by requireAuthProof
 
@@ -101,6 +105,7 @@ itemsRouter.post('/mint-and-transfer', requireAuthProof('mint-item'), async (req
 
     const mintActionRes = await serverWallet.createAction({
       description: 'Server minting item NFT with user WalletP2PKH payment',
+      labels: [itemMintLabel(inventoryItemId)],
       inputBEEF: paymentBeef,
       inputs: [
         {
@@ -230,8 +235,9 @@ itemsRouter.post('/mint-and-transfer', requireAuthProof('mint-item'), async (req
 
 // Repair the DB after a mint whose on-chain broadcast succeeded but whose DB write
 // failed. The wallet basket holds the token (source of truth); this route verifies
-// the claimed outpoint is a server mint locked to the session user, then re-writes
-// the DB. Guarded by requireSession — the provenance check is the real guard.
+// the claimed outpoint is locked to the session user and is in the server wallet's
+// history as this item's mint, then re-writes the DB. Guarded by requireSession —
+// the provenance check is the real guard.
 itemsRouter.post('/mint-and-transfer/record', requireSession, async (req: Request, res: Response) => {
   const userId = req.userId as string; // BSV identity key of the session user
   const { inventoryItemId, transferBeef, outpoint, keyId, itemData } = req.body;
@@ -292,6 +298,13 @@ itemsRouter.post('/mint-and-transfer/record', requireSession, async (req: Reques
 
   if (!onChainScript || onChainScript !== expectedScript) {
     res.status(400).json({ error: 'Outpoint is not a server mint locked to this user' });
+    return;
+  }
+
+  // Only the server wallet's own history proves the server made this mint, for this item.
+  const { actions } = await serverWallet.listActions({ labels: [itemMintLabel(inventoryItemId)], limit: 100 });
+  if (!actions.some((action) => action.txid === txid && action.status !== 'failed')) {
+    res.status(400).json({ error: 'Not a server mint for this item' });
     return;
   }
 
