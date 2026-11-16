@@ -9,6 +9,7 @@
     "jose": "^6.1.0",
     "dotenv": "^17.2.2",
     "express-async-errors": "^3.1.1",
+    "express-rate-limit": "^8.7.4",
     "@bsv/sdk": "^2.0.13",
     "@bsv/auth": "^0.0.1",
     "@bsv/wallet-toolbox-client": "^2.1.21",

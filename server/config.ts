@@ -20,4 +20,9 @@ export const config = Object.freeze({
   bsvNetwork: (process.env.BSV_NETWORK as 'test' | 'main') || 'main',
   // Credentialed cross-origin allowlist (comma-separated origins). Empty = same-origin only.
   allowedOrigins: (process.env.ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+  // Header holding the real client IP behind a trusted proxy (e.g. cf-connecting-ip); unset = socket IP.
+  // Read per request, so tests can set it.
+  get clientIpHeader(): string | undefined {
+    return process.env.CLIENT_IP_HEADER?.trim() || undefined;
+  },
 });

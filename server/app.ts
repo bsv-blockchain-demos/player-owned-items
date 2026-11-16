@@ -4,6 +4,7 @@ import cookieParser from 'cookie-parser';
 import { mountRoutes } from './routes';
 import { errorHandler } from './middleware/errorHandler';
 import { config } from './config';
+import { rateLimiters } from './middleware/rateLimit';
 
 /**
  * Build the Express app: JSON + cookies, health, feature routers, and a
@@ -39,6 +40,12 @@ export function buildApp(): Express {
       next();
     });
   }
+
+  // After CORS so a 429 still carries CORS headers; before the body parser so a limited
+  // request's body is never parsed.
+  const limiters = rateLimiters();
+  app.use('/api', limiters.api);
+  app.use('/api/login', limiters.login);
 
   app.use(express.json());
   app.use(cookieParser());
