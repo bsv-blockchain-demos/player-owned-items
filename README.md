@@ -132,6 +132,13 @@ Rate limits are per client per minute, in memory ([server/middleware/rateLimit.t
 
 Serve `client/dist` with SPA history fallback and the intended `VITE_API_BASE` built in. Configure the API origin allowlist, cookie behaviour and database connection for the deployment. Keep the API to one instance, retain the server wallet key, and preserve MongoDB records and transaction backups.
 
+**Container images.** Pushing a version tag (`git tag v1.2.3 && git push origin v1.2.3`) runs [.github/workflows/build.yml](.github/workflows/build.yml), which builds and pushes (linux/amd64 + arm64):
+
+- `ghcr.io/bsv-blockchain-demos/player-owned-items-frontend:<tag>`: [client/Dockerfile](client/Dockerfile), the SPA served by `serve -s` on port 3000. `VITE_API_BASE` comes from the repo secret of that name; leave it empty to serve the API on the same origin, with the ingress routing `/api` to the backend.
+- `ghcr.io/bsv-blockchain-demos/player-owned-items-backend:<tag>`: [server/Dockerfile](server/Dockerfile), the API on port 4000. Server env as in Local setup, plus `CLIENT_IP_HEADER` behind a proxy. It does not run `db:migrate`; create the indexes before the first deploy.
+
+Both build from the repo root. PRs and branch pushes don't build images.
+
 Before using the demo with valuable items, validate the complete transaction lifecycle, recovery after partial failures and enforcement of game rules. Server issuance and an application index do not by themselves prove that every game event was valid.
 
 ## Licence
