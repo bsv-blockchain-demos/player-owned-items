@@ -128,6 +128,8 @@ With the checked-in lockfile, the README review on Node.js 22 and npm 11 found t
 
 ## Deployment notes
 
+Rate limits are per client per minute, in memory ([server/middleware/rateLimit.ts](server/middleware/rateLimit.ts)): 120 for `/api` overall and 10 for login. The wallet routes get only the general limit, because each receives a payment the client has already broadcast and a 429 would strand it. Behind a proxy, set `CLIENT_IP_HEADER` (e.g. `cf-connecting-ip` behind Cloudflare) or every client shares the proxy's limit; its value must be a single IP, so `x-forwarded-for` doesn't work.
+
 Serve `client/dist` with SPA history fallback and the intended `VITE_API_BASE` built in. Configure the API origin allowlist, cookie behaviour and database connection for the deployment. Keep the API to one instance, retain the server wallet key, and preserve MongoDB records and transaction backups.
 
 Before using the demo with valuable items, validate the complete transaction lifecycle, recovery after partial failures and enforcement of game rules. Server issuance and an application index do not by themselves prove that every game event was valid.
